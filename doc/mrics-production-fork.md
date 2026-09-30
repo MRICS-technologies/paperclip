@@ -20,6 +20,8 @@ Every push to `mrics/prod` builds an amd64 production image and publishes:
 
 Production must deploy the immutable digest, not the mutable `prod` tag. The mutable tag is only a convenient pointer to the newest successful build.
 
+GitHub creates new GHCR packages as private and does not expose a package-visibility mutation through its API. An organization owner must make `paperclip` public once from the package settings page; subsequent image versions retain that visibility.
+
 ## Updating from an upstream release
 
 1. Fetch upstream and tags:
