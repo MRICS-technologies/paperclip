@@ -81,7 +81,7 @@ const nativeRunnerSuite =
 // In the PR workflow (pr.yml, the caller of pr-trusted.yml — reusable
 // workflows inherit the caller's GITHUB_WORKFLOW), the last Verify Paperclip
 // Runner vitest shard runs the native-runner group instead, because those
-// lanes restore the shared release-runner-v1 Rust cache (see
+// lanes restore the shared release-runner-v2 Rust cache (see
 // packages/paperclip-runner/scripts/run-pr-vitest-lane.mjs). Every other
 // caller — local runs, release-verify.yml under the Release and Cloud
 // readiness workflows — keeps the suite in the server shards, so a renamed or
