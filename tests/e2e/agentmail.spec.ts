@@ -12,6 +12,7 @@ test("AgentMail setup and email work through the normal task conversation", asyn
   page,
   request,
 }) => {
+  await page.setViewportSize({ width: 1440, height: 1080 });
   const created = await request.post("/api/companies", {
     data: { name: `AgentMail browser ${Date.now()}` },
   });
@@ -51,6 +52,9 @@ test("AgentMail setup and email work through the normal task conversation", asyn
     lastSyncAt: new Date().toISOString(),
   };
   let connected = false;
+  const setupRequests: { idempotencyKey: string; username?: string }[] = [];
+  const addressTakenError = "This email address is already in use. Choose a different address.";
+  const permissionError = "AgentMail did not allow Paperclip to create an inbox-scoped API key. Check your API key permissions and AgentMail account limits, then try again.";
   const sends: any[] = [];
   const conversationId = randomUUID();
   const thread = {
@@ -102,6 +106,13 @@ test("AgentMail setup and email work through the normal task conversation", asyn
       const body = route.request().postDataJSON();
       expect(body.receiveMode).toBe("websocket");
       expect(body.assignedAgentId).toBe(agent.id);
+      setupRequests.push(body);
+      if (setupRequests.length === 1) return fulfill(route, { error: addressTakenError, code: "agentmail_address_taken",
+        details: { field: "username", providerStatus: 403, operation: "create_inbox" } }, 409);
+      if (setupRequests.length === 2) return fulfill(route, {
+        error: permissionError,
+        details: { code: "agentmail_request_failed", providerStatus: 403, operation: "create_inbox_key" },
+      }, 422);
       connected = true;
       return fulfill(route, inbox, 201);
     }
@@ -141,52 +152,46 @@ test("AgentMail setup and email work through the normal task conversation", asyn
   await page.getByRole("combobox").click();
   await page.getByPlaceholder("Search all agents…").fill("Mail agent");
   await page.getByRole("option", { name: "Mail agent" }).click();
-  await expect(
-    page.getByText("Mail agent is not a low-trust agent"),
-  ).toBeVisible();
-  await page.getByRole("button", { name: "Configure low trust" }).click();
+  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  const addressField = page.getByLabel("Mail agent’s email address", { exact: true });
+  await expect(addressField).toHaveValue("mail-agent");
+  await expect(page.getByRole("button", { name: "Review email address" })).toHaveCount(0);
+  await page.getByText("Advanced options", { exact: true }).click();
+  await expect(page.getByLabel("Domain", { exact: true }).locator("option", { hasText: "verified.example.test" })).toHaveCount(1);
+  await page.getByRole("button", { name: "Review trust settings" }).click();
   const trustDialog = page.getByRole("dialog");
-  await trustDialog
-    .getByRole("combobox")
-    .first()
-    .selectOption("low_trust_review");
+  await trustDialog.getByRole("combobox").first().selectOption("low_trust_review");
   await trustDialog.getByRole("combobox").nth(1).selectOption("root_issue");
   await trustDialog.getByRole("combobox").nth(2).selectOption(task.id);
-  await trustDialog
-    .getByRole("button", { name: "Save trust settings" })
-    .click();
+  await trustDialog.getByRole("button", { name: "Save trust settings" }).click();
   await expect(page.getByText("Low-trust review configured")).toBeVisible();
   await page.getByRole("button", { name: "Review trust settings" }).click();
   await page.getByRole("dialog").getByRole("combobox").first().selectOption("standard");
   await page.getByRole("button", { name: "Save trust settings" }).click();
-  await expect(page.getByText("Mail agent is not a low-trust agent")).toBeVisible();
+  await expect(trustDialog).not.toBeVisible();
   const savedAgent = await (await request.get(`/api/agents/${agent.id}`)).json();
   expect(savedAgent.permissions.authorizationPolicy).toEqual({});
-  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await expect(page.getByRole("link", { name: "Set up allowlists ↗" })).toHaveAttribute(
+    "href", "https://docs.agentmail.to/knowledge-base/allowlists-blocklists");
   await page.getByText("Advanced options", { exact: true }).click();
-  await expect(
-    page
-      .getByLabel("Domain", { exact: true })
-      .locator("option", { hasText: "verified.example.test" }),
-  ).toHaveCount(1);
-  await page.getByRole("radio", { name: "Use an existing inbox" }).click();
-  await page.getByLabel("Available inbox").selectOption(inbox.address);
-  await page.getByRole("button", { name: "Review email address" }).click();
-  await expect(
-    page.getByText("Anyone can email an unrestricted inbox"),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("link", { name: "Set up allowlists ↗" }),
-  ).toHaveAttribute(
-    "href",
-    "https://docs.agentmail.to/knowledge-base/allowlists-blocklists",
-  );
-  await page
-    .getByRole("button", { name: "Connect email address", exact: true })
-    .click();
-  await expect(
-    page.getByRole("heading", { name: "Your agent’s email is ready" }),
-  ).toBeVisible();
+  await page.getByRole("button", { name: "Create email address", exact: true }).click();
+  await expect(page.getByRole("alert")).toHaveText(addressTakenError);
+  await expect(addressField).toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByRole("button", { name: "Create email address", exact: true })).toBeDisabled();
+  await page.screenshot({ path: test.info().outputPath("agentmail-address-taken.png"), fullPage: true });
+  await addressField.fill("mail-agent-free");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.reload();
+  await expect(addressField).toHaveValue("mail-agent-free");
+  await page.getByRole("button", { name: "Create email address", exact: true }).click();
+  await expect(page.getByText(permissionError, { exact: true })).toBeVisible();
+  await expect(page.getByText("Internal server error", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Your agent’s email is ready" })).toHaveCount(0);
+  await page.screenshot({ path: test.info().outputPath("agentmail-permission-denied.png"), fullPage: true });
+  await page.getByRole("button", { name: "Create email address", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Your agent’s email is ready" })).toBeVisible();
+  expect(setupRequests.map(input => input.username)).toEqual(["mail-agent", "mail-agent-free", "mail-agent-free"]);
+  expect(new Set(setupRequests.map(input => input.idempotencyKey)).size).toBe(1);
   await page.goto(`/${company.issuePrefix}/issues/${task.identifier}`);
   const email = page.getByRole("article", { name: "Email received", exact: true });
   await expect(email).toBeVisible();

@@ -1,11 +1,13 @@
+import { isUuidLike } from "@paperclipai/shared";
+import { ApiError } from "@/api/client";
+import { AgentMailApiKeyField } from "@/features/connections/AgentMailApiKeyField";
 import { ChatSetupNavigation } from "@/components/chat/ChatSetupNavigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
   ArrowRight,
   Check,
-  AlertTriangle,
   Mail,
 } from "lucide-react";
 import { useCompany } from "@/context/CompanyContext";
@@ -18,11 +20,9 @@ import { emailApi } from "@/api/email";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { RadioCardGroup } from "@/components/ui/radio-card";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { AgentIcon } from "@/components/AgentIconPicker";
 import { SearchableSelect } from "@/components/SearchableSelect";
-import { AccessStep } from "@/features/connections/ConnectionSetupFlow";
 import { TrustPresetSection } from "@/components/TrustPresetSection";
 import { EmailSafetyNotice } from "@/components/EmailSafetyNotice";
 import {
@@ -46,66 +46,76 @@ import type {
 const selectClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm";
 
+interface EmailSetupDraft {
+  connectionId: string; step: 0 | 1; agentId: string; requestId: string;
+  addressMode: "new" | "existing"; inboxId: string; username: string; domain: string;
+  mode: "websocket" | "webhook";
+}
+function readEmailSetupDraft(key: string): Partial<EmailSetupDraft> {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(key) ?? "{}");
+    if (!value || typeof value !== "object") return {};
+    const draft: Partial<EmailSetupDraft> = {};
+    for (const field of ["connectionId", "agentId", "inboxId", "username", "domain"] as const) {
+      if (typeof value[field] === "string") draft[field] = value[field];
+    }
+    if (value.step === 0 || value.step === 1) draft.step = value.step;
+    if (typeof value.requestId === "string" && isUuidLike(value.requestId)) draft.requestId = value.requestId;
+    if (value.addressMode === "new" || value.addressMode === "existing") draft.addressMode = value.addressMode;
+    if (value.mode === "websocket" || value.mode === "webhook") draft.mode = value.mode;
+    return draft;
+  } catch { return {}; }
+}
+
 export function EmailEndpointSetup() {
   const { selectedCompanyId } = useCompany();
   const [params] = useSearchParams();
+  if (!selectedCompanyId) return <p role="status" className="p-6 text-sm text-muted-foreground">Loading email setup…</p>;
+  return <EmailEndpointSetupForm key={`${selectedCompanyId}:${params.get("connectionId") ?? "new"}`} companyId={selectedCompanyId} />;
+}
+
+function EmailEndpointSetupForm({ companyId }: { companyId: string }) {
+  const [params] = useSearchParams();
   const navigate = useNavigate();
   const cache = useQueryClient();
-  const companyId = selectedCompanyId ?? "";
-  const [connectionId, setConnectionId] = useState(
-    params.get("connectionId") ?? "",
-  );
-  const [step, setStep] = useState(params.get("connectionId") ? 3 : 0);
-  const [agentId, setAgentId] = useState(params.get("agentId") ?? "");
-  const [grantKind, setGrantKind] = useState<"user" | "organization" | "agent">(
-    "user",
-  );
-  const [agentAccess, setAgentAccess] = useState<"specific" | "all">(
-    "specific",
-  );
-  const [agentIds, setAgentIds] = useState<Set<string>>(
-    new Set(params.get("agentId") ? [params.get("agentId")!] : []),
-  );
+  const draftKey = `paperclip.agentmail-setup:${companyId}:${params.get("connectionId") ?? "new"}`;
+  const [draft] = useState(() => readEmailSetupDraft(draftKey));
+  const [connectionId, setConnectionId] = useState(draft.connectionId ?? params.get("connectionId") ?? "");
+  const [step, setStep] = useState<0 | 1 | 2>(draft.step ?? 0);
+  const [agentId, setAgentId] = useState(draft.agentId ?? params.get("agentId") ?? "");
   const [apiKey, setApiKey] = useState("");
-  const [requestId] = useState(() => crypto.randomUUID());
-  const [addressMode, setAddressMode] = useState("new");
-  const [inboxId, setInboxId] = useState("");
-  const [username, setUsername] = useState("");
-  const [domain, setDomain] = useState("agentmail.to");
-  const [mode, setMode] = useState<"websocket" | "webhook">("websocket");
+  const [requestId] = useState(() => draft.requestId ?? crypto.randomUUID());
+  const [addressMode, setAddressMode] = useState<"new" | "existing">(draft.addressMode ?? "new");
+  const [inboxId, setInboxId] = useState(draft.inboxId ?? "");
+  const [username, setUsername] = useState(draft.username ?? "");
+  const [domain, setDomain] = useState(draft.domain ?? "agentmail.to");
+  const [mode, setMode] = useState<"websocket" | "webhook">(draft.mode ?? "websocket");
   const [trustOpen, setTrustOpen] = useState(false);
   const [permissions, setPermissions] = useState<Partial<AgentPermissions>>({});
-  const agents = useQuery({
-    queryKey: queryKeys.agents.list(companyId),
-    queryFn: () => agentsApi.list(companyId),
-    enabled: !!companyId,
-  });
-  const projects = useQuery({
-    queryKey: queryKeys.projects.list(companyId),
-    queryFn: () => projectsApi.list(companyId),
-    enabled: !!companyId && trustOpen,
-  });
-  const boundaryIssues = useQuery({
-    queryKey: ["email-boundary-issues", companyId],
-    queryFn: () => issuesApi.list(companyId),
-    enabled: !!companyId && trustOpen,
-  });
-  const chosen = agents.data?.find((a) => a.id === agentId);
+  const suggestedUsername = useRef(false);
+  useEffect(() => {
+    if (!companyId) return;
+    // Save progress, never the API key. The same request ID resumes partial setup.
+    try {
+      if (step === 2) sessionStorage.removeItem(draftKey);
+      else sessionStorage.setItem(draftKey, JSON.stringify({ connectionId, step, agentId,
+        requestId, addressMode, inboxId, username, domain, mode }));
+    } catch { /* Setup remains usable when browser storage is unavailable. */ }
+  }, [companyId, draftKey, connectionId, step, agentId, requestId, addressMode, inboxId, username, domain, mode]);
+  const agents = useQuery({ queryKey: queryKeys.agents.list(companyId),
+    queryFn: () => agentsApi.list(companyId), enabled: !!companyId });
+  const projects = useQuery({ queryKey: queryKeys.projects.list(companyId),
+    queryFn: () => projectsApi.list(companyId), enabled: !!companyId && trustOpen });
+  const boundaryIssues = useQuery({ queryKey: ["email-boundary-issues", companyId],
+    queryFn: () => issuesApi.list(companyId), enabled: !!companyId && trustOpen });
+  const chosen = agents.data?.find(a => a.id === agentId);
   const lowTrust = getTrustPreset(chosen?.permissions) === "low_trust_review";
-  const scoped = lowTrustBoundaryHasScope(
-    getLowTrustBoundary(chosen?.permissions),
-  );
-  const inspected = useQuery({
-    queryKey: ["email-credential-inspect", companyId, connectionId],
+  const scoped = lowTrustBoundaryHasScope(getLowTrustBoundary(chosen?.permissions));
+  const inspected = useQuery({ queryKey: ["email-credential-inspect", companyId, connectionId],
     queryFn: () => emailApi.inspectSaved(companyId, connectionId),
-    enabled: !!companyId && !!connectionId && step >= 3,
-    retry: false,
-  });
-  const inboxes = useQuery({
-    queryKey: ["email-inboxes", companyId],
-    queryFn: () => emailApi.list(companyId),
-    enabled: !!companyId,
-  });
+    enabled: !!companyId && !!connectionId, retry: false });
+  const inboxes = useQuery({ queryKey: ["email-inboxes", companyId],
+    queryFn: () => emailApi.list(companyId), enabled: !!companyId });
   const scopedKey = inspected.data?.scope.scope_type === "inbox";
   useEffect(() => {
     if (scopedKey) {
@@ -113,457 +123,159 @@ export function EmailEndpointSetup() {
       setInboxId(inspected.data?.inboxes[0]?.inbox_id ?? "");
     }
   }, [scopedKey, inspected.data]);
+  useEffect(() => {
+    if (chosen && !suggestedUsername.current) {
+      suggestedUsername.current = true;
+      if (!username) setUsername(chosen.name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").slice(0, 64));
+    }
+  }, [chosen, username]);
   const connect = useMutation({
-    mutationFn: () =>
-      emailApi.connect(companyId, {
-        apiKey,
-        grantKind: grantKind === "organization" ? "organization" : "user",
-        allAgents: agentAccess === "all",
-        agentIds: [...agentIds],
-        idempotencyKey: requestId,
-      }),
-    onSuccess: (result) => {
-      setApiKey("");
-      setConnectionId(result.id);
-      setStep(2);
-      void cache.invalidateQueries({
-        queryKey: queryKeys.tools.connections(companyId),
-      });
+    mutationFn: async () => {
+      if (!connectionId) {
+        const result = await emailApi.connect(companyId, {
+          apiKey: apiKey.trim(), grantKind: "organization", allAgents: false,
+          agentIds: [agentId], idempotencyKey: requestId,
+        });
+        setApiKey("");
+        setConnectionId(result.id);
+        void cache.invalidateQueries({ queryKey: queryKeys.tools.connections(companyId) });
+      }
     },
+    onSuccess: () => setStep(1),
   });
-  const agentDetail = useQuery({
-    queryKey: queryKeys.agents.detail(agentId),
-    queryFn: () => agentsApi.get(agentId),
-    enabled: !!agentId && trustOpen,
-  });
+  const agentDetail = useQuery({ queryKey: queryKeys.agents.detail(agentId),
+    queryFn: () => agentsApi.get(agentId), enabled: !!agentId && trustOpen });
   const trust = useMutation({
-    mutationFn: () =>
-      agentsApi.updatePermissions(
-        agentId,
-        {
-          ...permissions,
-          canCreateAgents: permissions.canCreateAgents ?? false,
-          canCreateSkills: permissions.canCreateSkills ?? true,
-          canAssignTasks: agentDetail.data?.access?.canAssignTasks ?? false,
-        },
-        companyId,
-      ),
+    mutationFn: () => agentsApi.updatePermissions(agentId, {
+      ...permissions,
+      canCreateAgents: permissions.canCreateAgents ?? false,
+      canCreateSkills: permissions.canCreateSkills ?? true,
+      canAssignTasks: agentDetail.data?.access?.canAssignTasks ?? false,
+    }, companyId),
     onSuccess: () => {
       setTrustOpen(false);
-      void cache.invalidateQueries({
-        queryKey: queryKeys.agents.list(companyId),
-      });
+      void cache.invalidateQueries({ queryKey: queryKeys.agents.list(companyId) });
     },
   });
   const setup = useMutation({
-    mutationFn: () =>
-      emailApi.setup(companyId, {
-        assignedAgentId: agentId,
-        credentialConnectionId: connectionId,
-        ...(addressMode === "existing" ? { inboxId } : { username, domain }),
-        receiveMode: mode,
-        idempotencyKey: requestId,
-      }),
+    mutationFn: () => emailApi.setup(companyId, {
+      assignedAgentId: agentId, credentialConnectionId: connectionId,
+      ...(addressMode === "existing" ? { inboxId } : { username, domain }),
+      receiveMode: mode, idempotencyKey: requestId,
+    }),
     onSuccess: () => {
       void cache.invalidateQueries({ queryKey: ["email-inboxes", companyId] });
-      void cache.invalidateQueries({
-        queryKey: queryKeys.tools.connectionInstalls(connectionId),
-      });
-      setStep(6);
+      void cache.invalidateQueries({ queryKey: queryKeys.tools.connectionInstalls(connectionId) });
+      setStep(2);
     },
   });
-  const address =
-    addressMode === "existing" ? inboxId : `${username}@${domain}`;
-  const labels =
-    step < 3
-      ? ["Access", "API key", "Connected"]
-      : ["Agent", "Email address", "Review"];
-  const current = step < 3 ? step : Math.min(step - 3, 2);
-  const error = connect.error ?? setup.error ?? inspected.error ?? agents.error;
-  const trustNotice = chosen && (
-    <div
-      className="space-y-3 rounded-lg border border-border bg-muted/30 p-4"
-      role={lowTrust && scoped ? "note" : "alert"}
-    >
-      <p className="flex items-center gap-2 text-sm font-medium">
-        {lowTrust && scoped ? (
-          <Check className="size-4" />
-        ) : (
-          <AlertTriangle className="size-4 text-(--status-agent-paused)" />
-        )}
-        {lowTrust
-          ? scoped
-            ? "Low-trust review configured"
-            : "Low trust needs a work boundary"
-          : `${chosen.name} is not a low-trust agent`}
-      </p>
-      <p className="text-sm text-muted-foreground">
-        {lowTrust
-          ? "Email tasks stay inside the configured project or root task boundary. Output is quarantined for trusted review."
-          : "Email can contain malicious instructions. We recommend Low-trust review to limit the agent’s access to Paperclip work."}
-      </p>
-      <p className="text-xs text-muted-foreground">Low-trust execution also requires isolated workspaces and an active sandbox environment in the agent’s runtime settings.</p>
-      <Button
-        size="sm"
-        variant="outline"
-        onClick={() => {
-          setPermissions(chosen.permissions);
-          setTrustOpen(true);
-        }}
-      >
-        {lowTrust ? "Review trust settings" : "Configure low trust"}
-      </Button>
-    </div>
-  );
-  return (
-    <div className="mx-auto max-w-3xl space-y-6 p-6">
-      <header className="flex items-center justify-between gap-3">
-        <h1 className="text-xl font-bold">
-          {step < 3
-            ? "Connect AgentMail"
-            : step === 6
-              ? "Your agent’s email is ready"
-              : "Give an agent an email address"}
-        </h1>
-        <Button
-          variant="ghost"
-          onClick={() =>
-            navigate(
-              connectionId ? `/apps/${connectionId}/permissions` : "/apps",
-            )
-          }
-        >
-          {step === 6 ? "Close" : "Cancel"}
-        </Button>
-      </header>
-      <ChatSetupNavigation
-        labels={labels}
-        step={current}
-        availableStep={current}
-        disabled={connect.isPending || setup.isPending || step === 2 || step === 6}
-        onSelect={(index) => setStep(step < 3 ? index : index + 3)}
-      />
-      {step === 0 && (
-        <AccessStep
-          companyId={companyId}
-          authKind="api_key"
-          grantKinds={["user", "organization"]}
-          grantKind={grantKind}
-          setGrantKind={setGrantKind}
-          installChoice={agentAccess}
-          setInstallChoice={setAgentAccess}
-          installAgentIds={agentIds}
-          setInstallAgentIds={setAgentIds}
-          onBack={() => navigate("/apps")}
-          onContinue={() => setStep(1)}
-          submitLabel="Continue"
-        />
-      )}
-      {step === 1 && (
-        <form
-          className="space-y-5"
-          onSubmit={(e) => {
-            e.preventDefault();
-            connect.mutate();
-          }}
-        >
-          <section className="space-y-4 rounded-xl border border-border p-6">
-            <h2 className="text-lg font-semibold">
-              Add your AgentMail API key
-            </h2>
-            <Label htmlFor="email-api-key">API key</Label>
-            <Input
-              id="email-api-key"
-              type="password"
-              autoComplete="off"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="Paste your AgentMail API key"
-            />
-            <a
-              href="https://console.agentmail.to"
-              target="_blank"
-              rel="noreferrer"
-              className="text-sm underline"
-            >
-              Get a key in AgentMail ↗
-            </a>
-          </section>
-          <div className="flex justify-between">
-            <Button type="button" variant="ghost" onClick={() => setStep(0)}>
-              Back
-            </Button>
-            <Button disabled={!apiKey.trim() || connect.isPending}>
-              {connect.isPending ? "Connecting…" : "Connect AgentMail"}
-            </Button>
+  const address = addressMode === "existing" ? inboxId : `${username}@${domain}`;
+  const knownAddress = addressMode === "new" && inspected.data?.inboxes.some(i => i.inbox_id.toLowerCase() === address.toLowerCase());
+  const addressTaken = knownAddress || (setup.error instanceof ApiError
+    && (setup.error.body as { code?: string } | null)?.code === "agentmail_address_taken");
+  const assignedInbox = addressMode === "existing" && inboxes.data?.some(i => i.address === inboxId && i.status !== "archived");
+  const addressError = addressTaken ? "This email address is already in use. Choose a different address."
+    : assignedInbox ? "This inbox is already assigned to an agent." : null;
+  const error = connect.error ?? (!addressTaken ? setup.error : null) ?? inspected.error ?? agents.error ?? inboxes.error;
+  const busy = connect.isPending || setup.isPending;
+  const canContinue = !!chosen && !busy && !(lowTrust && !scoped) && (!!connectionId || !!apiKey.trim());
+  const canCreate = !!chosen && !busy && !!inspected.data && !(lowTrust && !scoped) && !addressError
+    && (addressMode === "existing" ? !!inboxId : /^[a-z0-9][a-z0-9._-]*$/.test(username));
+  const openTrust = () => { if (chosen) { setPermissions(chosen.permissions); setTrustOpen(true); } };
+  const leave = () => navigate(connectionId ? `/apps/${connectionId}/permissions` : "/apps");
+  const cancel = () => { try { sessionStorage.removeItem(draftKey); } catch {} leave(); };
+  return <div className="mx-auto max-w-xl space-y-6 p-6">
+    <header className="space-y-2">
+      <h1 className="text-xl font-bold">{step === 2 ? "Your agent’s email is ready" : "Give an agent an email address"}</h1>
+    </header>
+    {step < 2 && <ChatSetupNavigation labels={["Agent", "Email address"]} step={step}
+      availableStep={step} disabled={busy} onSelect={index => { setup.reset(); setStep(index as 0 | 1); }} />}
+    {step === 0 && <form className="space-y-6" onSubmit={event => { event.preventDefault(); if (canContinue) connect.mutate(); }}>
+      <div className="space-y-2">
+        <Label>Agent</Label>
+        <SearchableSelect value={agentId} disabled={busy} loading={agents.isPending} placeholder="Choose an agent" searchPlaceholder="Search all agents…" emptyMessage="No agents found."
+          groups={[{ id: "agents", options: (agents.data ?? []).filter(a => !["terminated", "pending_approval"].includes(a.status))
+            .map(a => ({ key: a.id, value: a.id, label: a.name, icon: a.icon })) }]}
+          onValueChange={(id, option) => { setAgentId(id); setUsername(option.label.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").slice(0, 64)); }}
+          renderValue={option => option ? <span className="flex items-center gap-2"><Avatar size="sm"><AvatarFallback><AgentIcon icon={String(option.icon ?? "bot")} /></AvatarFallback></Avatar>{option.label}</span> : "Choose an agent"} />
+      </div>
+      {!connectionId && <AgentMailApiKeyField value={apiKey} onChange={value => { setApiKey(value); connect.reset(); }} disabled={busy} />}
+      {lowTrust && !scoped && <div role="alert" className="space-y-2 text-sm">
+        <p>This agent needs a work boundary before it can receive email.</p>
+        <Button type="button" variant="outline" size="sm" onClick={openTrust}>Configure work boundary</Button>
+      </div>}
+      {error && <p role="alert" className="text-sm text-destructive">{error.message}</p>}
+      <div className="flex items-center justify-between gap-3 border-t border-border pt-5">
+        <Button type="button" variant="ghost" disabled={busy} onClick={cancel}>Cancel</Button>
+        <Button disabled={!canContinue}>{connect.isPending ? "Connecting…" : "Continue"}<ArrowRight className="size-4" /></Button>
+      </div>
+    </form>}
+    {step === 1 && <form className="space-y-6" onSubmit={event => { event.preventDefault(); if (canCreate) setup.mutate(); }}>
+      <div className="space-y-2">
+        <Label htmlFor={addressMode === "new" ? "email-name" : "email-existing"}>{chosen?.name}’s email address</Label>
+        {addressMode === "new" ? <>
+          <div className="flex items-center gap-2">
+            <Input id="email-name" className="min-w-0" value={username} maxLength={64} autoComplete="off" spellCheck={false} disabled={busy}
+              aria-invalid={!!addressError} aria-describedby={addressError ? "email-address-error" : undefined}
+              onChange={event => { setUsername(event.target.value.toLowerCase()); setup.reset(); }} />
+            <span className="max-w-1/2 shrink-0 break-all text-sm text-muted-foreground">@{domain}</span>
           </div>
-        </form>
-      )}
-      {step === 2 && (
-        <section className="space-y-5 rounded-xl border border-border p-6">
-          <h2 className="text-lg font-semibold">AgentMail is connected</h2>
-          <p className="text-sm text-muted-foreground">
-            Next, give an agent an email address from Permissions.
-          </p>
-          <div className="flex justify-end">
-            <Button
-              onClick={() => navigate(`/apps/${connectionId}/permissions`)}
-            >
-              Open permissions <ArrowRight className="size-4" />
-            </Button>
+        </> : <select id="email-existing" className={selectClass} value={inboxId} disabled={busy || scopedKey}
+          aria-invalid={!!addressError} aria-describedby={addressError ? "email-address-error" : undefined}
+          onChange={event => { setInboxId(event.target.value); setup.reset(); }}>
+          <option value="">Choose an inbox</option>
+          {inspected.data?.inboxes.map(i => {
+            const assigned = inboxes.data?.some(e => e.address === i.inbox_id && e.status !== "archived");
+            return <option key={i.inbox_id} value={i.inbox_id} disabled={assigned}>{i.inbox_id}{assigned ? " — already assigned" : ""}</option>;
+          })}
+        </select>}
+        {addressError && <p id="email-address-error" role="alert" className="text-sm text-destructive">{addressError}</p>}
+        {!scopedKey && <Button type="button" variant="link" size="sm" className="h-auto p-0" disabled={busy}
+          onClick={() => { setAddressMode(addressMode === "new" ? "existing" : "new"); setup.reset(); }}>
+          {addressMode === "new" ? "Use an existing inbox" : "Create a new address"}
+        </Button>}
+        <p className="text-sm text-muted-foreground">Incoming email creates tasks for {chosen?.name}. Replies stay in the same task.</p>
+      </div>
+      <details className="space-y-4">
+        <summary className="cursor-pointer text-sm text-muted-foreground">Advanced options</summary>
+        <div className="space-y-4">
+          {addressMode === "new" && <div className="space-y-2">
+            <Label htmlFor="email-domain">Domain</Label>
+            <select id="email-domain" value={domain} disabled={busy} className={selectClass} onChange={event => { setDomain(event.target.value); setup.reset(); }}>
+              <option>agentmail.to</option>
+              {inspected.data?.domains.filter(d => d.status === "VERIFIED").map(d => <option key={d.domain_id}>{d.domain}</option>)}
+            </select>
+            <a className="text-sm underline" href="https://docs.agentmail.to/custom-domains" target="_blank" rel="noreferrer">Set up a custom domain ↗</a>
+          </div>}
+          <div className="space-y-2">
+            <Label htmlFor="email-mode">Receiving</Label>
+            <select id="email-mode" value={mode} disabled={busy} className={selectClass} onChange={event => setMode(event.target.value as typeof mode)}>
+              <option value="websocket">Live connection</option><option value="webhook">Webhook</option>
+            </select>
           </div>
-        </section>
-      )}
-      {step === 3 && (
-        <>
-          <section className="space-y-4 rounded-xl border border-border p-6">
-            <h2 className="text-lg font-semibold">
-              Who should handle this inbox?
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              Incoming email will create tasks assigned to this agent.
-            </p>
-            <Label>Agent</Label>
-            <SearchableSelect
-              value={agentId}
-              placeholder="Choose an agent"
-              searchPlaceholder="Search all agents…"
-              emptyMessage="No agents found."
-              groups={[
-                {
-                  id: "agents",
-                  options: (agents.data ?? [])
-                    .filter(
-                      (a) =>
-                        !["terminated", "pending_approval"].includes(a.status),
-                    )
-                    .map((a) => ({
-                      key: a.id,
-                      value: a.id,
-                      label: a.name,
-                      icon: a.icon,
-                    })),
-                },
-              ]}
-              onValueChange={(id, option) => {
-                setAgentId(id);
-                setUsername(
-                  option.label
-                    .toLowerCase()
-                    .replace(/[^a-z0-9._-]+/g, "-")
-                    .slice(0, 64),
-                );
-              }}
-              renderValue={(option) =>
-                option && (
-                  <span className="flex items-center gap-2">
-                    <Avatar size="sm">
-                      <AvatarFallback>
-                        <AgentIcon icon={String(option.icon ?? "bot")} />
-                      </AvatarFallback>
-                    </Avatar>
-                    {option.label}
-                  </span>
-                )
-              }
-            />
-            <p className="text-xs text-muted-foreground">
-              Activating this inbox also adds the agent to this connection’s
-              allowed agents.
-            </p>
-          </section>
-          {trustNotice}
-        </>
-      )}
-      {step === 4 && (
-        <>
-          <section className="space-y-5 rounded-xl border border-border p-6">
-            <h2 className="text-lg font-semibold">
-              Choose {chosen?.name}’s email address
-            </h2>
-            <RadioCardGroup
-              ariaLabel="Email address source"
-              value={addressMode}
-              onValueChange={setAddressMode}
-              options={[
-                {
-                  value: "new",
-                  title: "Create a new address",
-                  disabled: scopedKey,
-                },
-                { value: "existing", title: "Use an existing inbox" },
-              ]}
-            />
-            {addressMode === "new" ? (
-              <div className="space-y-2">
-                <Label htmlFor="email-name">Email address</Label>
-                <div className="flex items-center gap-2">
-                  <Input
-                    id="email-name"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value.toLowerCase())}
-                  />
-                  <span className="text-sm text-muted-foreground">
-                    @{domain}
-                  </span>
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <Label htmlFor="email-existing">Available inbox</Label>
-                <select
-                  id="email-existing"
-                  className={selectClass}
-                  value={inboxId}
-                  onChange={(e) => setInboxId(e.target.value)}
-                >
-                  <option value="">Choose an inbox</option>
-                  {inspected.data?.inboxes.map((i) => (
-                    <option
-                      key={i.inbox_id}
-                      disabled={inboxes.data?.some(
-                        (e) =>
-                          e.address === i.inbox_id && e.status !== "archived",
-                      )}
-                      value={i.inbox_id}
-                    >
-                      {i.inbox_id}
-                      {inboxes.data?.some((e) => e.address === i.inbox_id)
-                        ? " — already assigned"
-                        : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-            <details className="border-t border-border pt-4">
-              <summary className="cursor-pointer text-sm text-muted-foreground">
-                Advanced options
-              </summary>
-              <div className="space-y-4 pt-4">
-                {addressMode === "new" && (
-                  <>
-                    <Label htmlFor="email-domain">Domain</Label>
-                    <select
-                      id="email-domain"
-                      value={domain}
-                      onChange={(e) => setDomain(e.target.value)}
-                      className={selectClass}
-                    >
-                      <option>agentmail.to</option>
-                      {inspected.data?.domains
-                        .filter((d) => d.status === "VERIFIED")
-                        .map((d) => (
-                          <option key={d.domain_id}>{d.domain}</option>
-                        ))}
-                    </select>
-                    <a
-                      className="text-sm underline"
-                      href="https://docs.agentmail.to/custom-domains"
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Set up a custom domain in AgentMail ↗
-                    </a>
-                  </>
-                )}
-                <Label htmlFor="email-mode">Receiving</Label>
-                <select
-                  id="email-mode"
-                  value={mode}
-                  onChange={(e) => setMode(e.target.value as typeof mode)}
-                  className={selectClass}
-                >
-                  <option value="websocket">
-                    Live connection — works locally
-                  </option>
-                  <option value="webhook">
-                    Webhook — requires public HTTPS
-                  </option>
-                </select>
-              </div>
-            </details>
-          </section>
           <EmailSafetyNotice />
-        </>
-      )}
-      {step === 5 && (
-        <>
-          <EmailSafetyNotice />
-          {trustNotice}
-          <section className="space-y-4 rounded-xl border border-border p-6">
-            <h2 className="text-lg font-semibold">
-              Ready to start receiving email?
-            </h2>
-            <p className="text-lg font-semibold">{address}</p>
-            <p className="text-sm">
-              Assigned to {chosen?.name} ·{" "}
-              {mode === "websocket" ? "Live connection" : "Signed webhook"}
-            </p>
-            <p className="text-sm text-muted-foreground">
-              New conversations create tasks. Replies stay in the same task.
-              Task comments stay internal.
-            </p>
-          </section>
-        </>
-      )}
-      {step === 6 && (
-        <section className="space-y-5 rounded-xl border border-border p-6">
-          <p className="flex items-center gap-2 text-sm">
-            <Check className="size-4" />
-            Receiving email for {chosen?.name}
-          </p>
-          <p className="text-lg font-semibold">{setup.data?.address}</p>
-          <EmailSafetyNotice />
-          <Button onClick={() => navigate(`/apps/${connectionId}/permissions`)}>
-            Back to permissions
-          </Button>
-        </section>
-      )}
-      {step >= 3 && step <= 5 && (
-        <div className="flex justify-between border-t border-border pt-5">
-          <Button
-            variant="ghost"
-            onClick={() =>
-              step === 3
-                ? navigate(`/apps/${connectionId}/permissions`)
-                : setStep(step - 1)
-            }
-          >
-            <ArrowLeft className="size-4" />
-            Back
-          </Button>
-          <Button
-            disabled={
-              !chosen ||
-              (lowTrust && !scoped) ||
-              (step >= 4 &&
-                (!inspected.data ||
-                  (addressMode === "existing"
-                    ? !inboxId
-                    : !/^[a-z0-9][a-z0-9._-]*$/.test(username)))) ||
-              setup.isPending
-            }
-            onClick={() => (step === 5 ? setup.mutate() : setStep(step + 1))}
-          >
-            {setup.isPending
-              ? "Activating…"
-              : step === 5
-                ? addressMode === "new"
-                  ? "Create email address"
-                  : "Connect email address"
-                : step === 4
-                  ? "Review email address"
-                  : "Continue"}
-            <ArrowRight className="size-4" />
-          </Button>
+          <div className="space-y-2 text-sm">
+            <p>{lowTrust && scoped ? "Low-trust review configured" : "Manage which tasks and tools this agent can access."}</p>
+            <Button type="button" variant="outline" size="sm" onClick={openTrust}>Review trust settings</Button>
+          </div>
         </div>
-      )}
-      {error && (
-        <p role="alert" className="text-sm text-destructive">
-          {error.message}
-        </p>
-      )}
+      </details>
+      {error && <p role="alert" className="text-sm text-destructive">{error.message}</p>}
+      {inspected.isPending && <p role="status" className="text-sm text-muted-foreground">Loading email options…</p>}
+      <div className="flex items-center justify-between gap-3 border-t border-border pt-5">
+        <Button type="button" variant="ghost" disabled={busy} onClick={() => { setup.reset(); setStep(0); }}><ArrowLeft className="size-4" />Back</Button>
+        <Button disabled={!canCreate}>
+          {setup.isPending ? "Connecting…" : addressMode === "new" ? "Create email address" : "Connect email address"}<ArrowRight className="size-4" />
+        </Button>
+      </div>
+    </form>}
+    {step === 2 && <div className="space-y-6">
+      <div className="space-y-2"><p className="flex items-center gap-2 font-medium"><Check className="size-4" />{setup.data?.address}</p>
+        <p className="text-sm text-muted-foreground">{chosen?.name} can now receive email at this address.</p></div>
+      <div className="flex items-center justify-between gap-3 border-t border-border pt-5">
+        <Button variant="ghost" onClick={leave}>Email settings</Button><Button onClick={leave}>Done</Button>
+      </div>
+    </div>}
       <Dialog open={trustOpen} onOpenChange={setTrustOpen}>
         <DialogContent className="max-h-screen overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
@@ -616,8 +328,7 @@ export function EmailEndpointSetup() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
-  );
+  </div>;
 }
 
 export function EmailConnectionInboxes({
@@ -783,16 +494,7 @@ export function EmailEndpointSettings({
         </Button>
       </div>
       <div className="space-y-2">
-        <Label htmlFor="email-reconnect-key">
-          Reconnect this inbox with a new API key
-        </Label>
-        <Input
-          id="email-reconnect-key"
-          type="password"
-          autoComplete="off"
-          value={replacementKey}
-          onChange={(e) => setReplacementKey(e.target.value)}
-        />
+        <AgentMailApiKeyField label="Reconnect this inbox with a new API key" value={replacementKey} onChange={setReplacementKey} disabled={reconnect.isPending} />
         <Label htmlFor="email-reconnect-mode">Receiving mode</Label>
         <select
           id="email-reconnect-mode"

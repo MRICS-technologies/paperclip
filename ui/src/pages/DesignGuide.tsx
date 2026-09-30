@@ -1,3 +1,4 @@
+import { AgentMailApiKeyField } from "@/features/connections/AgentMailApiKeyField";
 import { TaskBrowserFooter } from "@/components/task-side-panel/TaskBrowserFooter";
 import { TaskBrowserActivity } from "@/components/task-side-panel/TaskBrowserActivity";
 import type { TaskBrowser } from "@paperclipai/shared";
@@ -494,6 +495,7 @@ function ComposerActionsExample() {
 }
 
 export function DesignGuide() {
+  const [agentmailDemoKey, setAgentmailDemoKey] = useState("");
   const [wizardStep, setWizardStep] = useState(0);
   const [status, setStatus] = useState("todo");
   const [priority, setPriority] = useState("medium");
@@ -2297,7 +2299,8 @@ export function DesignGuide() {
           the full-page Apps setup; this card owns only audience, dialog, and task refresh behavior.
           Pending connections stay in the timeline beside a usable composer. The independently
           addressable Connections/In-task connections stories cover access, OAuth recovery, narrow
-          layouts, completion, and historical outcomes.
+          layouts, completion, and historical outcomes. AgentMail uses an inline API-key field
+          with fixed access defaults; its field and direct key-page link are shared with Apps setup.
         </p>
         <div className="grid gap-4 xl:grid-cols-3">
           <IssueThreadInteractionCard
@@ -2312,6 +2315,14 @@ export function DesignGuide() {
             interaction={connectedConnectionIntentInteraction}
             currentUserId={issueThreadInteractionFixtureMeta.currentUserId}
           />
+        </div>
+      </Section>
+
+      <Section title="AgentMail API key">
+        <p className="text-sm text-muted-foreground">AgentMail setup has two steps: pick an agent, then pick an email address. Ask for the API key alongside the agent only when needed. Keep address errors beside the field and additional settings under Advanced options.</p>
+        <p className="text-sm text-muted-foreground">Preview only. This field does not save or submit a credential.</p>
+        <div className="max-w-md">
+          <AgentMailApiKeyField value={agentmailDemoKey} onChange={setAgentmailDemoKey} />
         </div>
       </Section>
 

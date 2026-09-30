@@ -285,13 +285,22 @@ const support = await getEmbeddedPostgresTestSupport();
       await resetQuestions();
       const service = connectionIntentService(db);
       expect((await service.search(claims, "agentmail")).results.some(item => item.service === "agentmail")).toBe(false);
+      await expect(service.request(claims, "agentmail")).rejects.toThrow(/not available/);
       await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
       try {
         const result = await service.search(claims, "agentmail");
         expect(result.results[0]?.methods).toEqual([expect.objectContaining({
           key: "email-agent", purpose: "channel", setupPath: `/AGG/apps/chat/connect?provider=agentmail&purpose=chat&agentId=${claims.sub}`,
         })]);
-        expect(result.instruction).toContain("setupPath");
+        expect(result.instruction).toContain("connection_request");
+        const requested = await service.request(claims, "agentmail");
+        expect(requested).toMatchObject({ state: "needs_user_action", interactionId: expect.any(String) });
+        expect(await service.request(claims, "agentmail")).toMatchObject({ interactionId: requested.interactionId });
+        const options = await service.setupOptions(requested.interactionId!);
+        expect(options.interaction.payload).toMatchObject({ purpose: "channel", serviceSlug: "agentmail", requestingAgentId: claims.sub });
+        expect(options.emailSetup).toEqual({ credentialConnectionId: null, readyConnectionId: null });
+        await service.decline(requested.interactionId!, "responsible-user");
+        await expect(service.request(claims, "agentmail")).rejects.toThrow(/already been resolved/);
         const browse = await service.search(claims, "");
         expect(browse.results.some(item => item.service === "agentmail")).toBe(true);
         expect(browse.results.some(item => item.service === "anthropic")).toBe(true);
