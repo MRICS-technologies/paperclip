@@ -235,6 +235,20 @@ describe("AgentMail protocol boundary", () => {
       .rejects.toMatchObject({ status: 429, retryAfterMs: 9000, providerCode: "unknown", operation: "send_message" });
     expect(fetcher).toHaveBeenCalledOnce();
   });
+  it.each([403, 429])("preserves HTTP %s when the response body is already locked", async (status) => {
+    const response = new Response(JSON.stringify({ code: "missing_permission" }), {
+      status,
+      headers: { "retry-after": "9" },
+    });
+    const owner = response.body!.getReader();
+    try {
+      await expect(agentmailApi("private-key", vi.fn().mockResolvedValue(response))
+        .send("private@example.test", {}, "private-key"))
+        .rejects.toMatchObject({ status, retryAfterMs: 9000, providerCode: "unknown", operation: "send_message" });
+    } finally {
+      owner.releaseLock();
+    }
+  });
   it("constructs deliberate reply-all from visible recipients, excluding self and Bcc", () => {
     const envelope = {
       from: "Sender <sender@example.test>",

@@ -75,16 +75,18 @@ const providerOperations = [
 type ProviderOperation = (typeof providerOperations)[number][2] | "request";
 
 async function readProviderErrorCode(response: Response): Promise<ProviderErrorCode> {
-  if (!response.body) return "unknown";
-  const reader = response.body.getReader();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
+    if (!response.body) return "unknown";
+    const bodyReader = response.body.getReader();
+    reader = bodyReader;
     return await Promise.race([
       (async (): Promise<ProviderErrorCode> => {
         const parts: Uint8Array[] = [];
         let bytes = 0;
         for (;;) {
-          const part = await reader.read();
+          const part = await bodyReader.read();
           if (part.done) break;
           bytes += part.value.length;
           if (bytes > 8 * 1024) return "unknown";
@@ -105,7 +107,7 @@ async function readProviderErrorCode(response: Response): Promise<ProviderErrorC
     return "unknown";
   } finally {
     clearTimeout(timeout);
-    void reader.cancel().catch(() => {});
+    void reader?.cancel().catch(() => {});
   }
 }
 
