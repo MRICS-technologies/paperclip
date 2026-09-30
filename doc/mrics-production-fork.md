@@ -20,7 +20,7 @@ Every push to `mrics/prod` builds an amd64 production image and publishes:
 
 Production must deploy the immutable digest, not the mutable `prod` tag. The mutable tag is only a convenient pointer to the newest successful build.
 
-GitHub creates new GHCR packages as private and does not expose a package-visibility mutation through its API. An organization owner must make `paperclip` public once from the package settings page; subsequent image versions retain that visibility.
+The MRICS GHCR package is intentionally private. Every deployment server must authenticate to `ghcr.io` as its Coolify server user with a dedicated token that can read packages. Docker stores the credential in that user's `~/.docker/config.json`; rotate the token and repeat `docker login` before it expires or is revoked.
 
 ## Updating from an upstream release
 

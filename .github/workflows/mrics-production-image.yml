@@ -6,6 +6,8 @@ on:
       - "mrics/prod"
     tags:
       - "mrics/v*"
+    paths-ignore:
+      - "doc/**"
   workflow_dispatch:
 
 permissions: {}
