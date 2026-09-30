@@ -80,6 +80,23 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-amd64
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-amd64,mode=max
 
+      - name: Make the repository-linked package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_url="/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/paperclip"
+          for attempt in 1 2 3 4 5; do
+            if gh api --method PATCH "$package_url" -f visibility=public --silent; then
+              gh api "$package_url" --jq '{name: .name, visibility: .visibility}'
+              exit 0
+            fi
+            sleep $((attempt * 3))
+          done
+          echo "Unable to make the container package public" >&2
+          exit 1
+
       - name: Publish immutable deployment reference
         shell: bash
         run: |
