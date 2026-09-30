@@ -13,6 +13,11 @@ import { ChatEndpointSetup } from "@/pages/apps/chat/ChatEndpointSetup";
 import { storybookAgents } from "../fixtures/paperclipData";
 
 const companyId = "company-storybook";
+// Hosted Storybooks live below a branch path; reuse their bundled GitHub marks.
+const githubBranding = {
+  logoUrl: "./brands/apps/github.svg",
+  darkLogoUrl: "./brands/apps/github-dark.svg",
+};
 
 function GitHubConnections({ saved = false, chatEnabled = true }) {
   const location = useLocation();
@@ -23,8 +28,8 @@ function GitHubConnections({ saved = false, chatEnabled = true }) {
     const github = getAppStoreDefinition("github")!;
     result.setQueryData(queryKeys.apps.gallery(companyId), {
       apps: [
-        { ...github, ownershipAvailability: { platform_shared: true, customer: true } },
-        getAppStoreDefinition("github-code-review-bot"),
+        { ...github, branding: githubBranding, ownershipAvailability: { platform_shared: true, customer: true } },
+        { ...getAppStoreDefinition("github-code-review-bot"), branding: githubBranding },
       ],
       capabilities: { canSetCompanyInstall: true, canCreatePersonalConnection: true, canCreateOrganizationConnection: true },
     });
