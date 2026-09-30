@@ -708,17 +708,26 @@ export function mapFinalResultForTest(input: {
   };
 }
 
+function deadlineSignal(deadlineAt: number): AbortSignal | null {
+  const remainingMs = Math.ceil(deadlineAt - Date.now());
+  return remainingMs > 0 ? AbortSignal.timeout(remainingMs) : null;
+}
+
 async function stopRun(input: {
   ctx: AdapterExecutionContext;
   baseUrl: URL;
   headers: Record<string, string>;
   runId: string;
+  deadlineAt: number;
   redactText?: TextRedactor;
 }): Promise<Record<string, unknown> | null> {
   try {
+    const signal = deadlineSignal(input.deadlineAt);
+    if (!signal) return null;
     const stopped = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
       method: "POST",
       headers: input.headers,
+      signal,
     });
     await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
     return asRecord(stopped);
@@ -732,14 +741,16 @@ async function fetchFinalStatus(input: {
   baseUrl: URL;
   headers: Record<string, string>;
   runId: string;
-  deadlineMs: number;
+  deadlineAt: number;
 }): Promise<Record<string, unknown> | null> {
-  const deadline = Date.now() + input.deadlineMs;
-  while (Date.now() < deadline) {
+  while (Date.now() < input.deadlineAt) {
     try {
+      const signal = deadlineSignal(input.deadlineAt);
+      if (!signal) return null;
       const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
         method: "GET",
         headers: input.headers,
+        signal,
       });
       const record = asRecord(status);
       const normalized = extractStatus(status);
@@ -747,7 +758,9 @@ async function fetchFinalStatus(input: {
     } catch {
       return null;
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(500, Math.max(0, input.deadlineAt - Date.now()))),
+    );
   }
   return null;
 }
@@ -874,19 +887,51 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ctx.onLog("stdout", `[hermes-gateway] creating run at ${createRunUrl} (timeout=${timeoutSec}s, session=${strategy})\n`);
   await ctx.onLog("stdout", `[hermes-gateway] request headers (redacted): ${stringifyForLog(redactForLog(runHeaders, [], 0, redactText), 3_000)}\n`);
 
+  await ctx.onCancellationReady?.();
+  let resolveCancellation!: (outcome: "cancelled") => void;
+  const cancellationPromise = new Promise<"cancelled">((resolve) => {
+    resolveCancellation = resolve;
+  });
+  const onCancellation = () => resolveCancellation("cancelled");
+  ctx.signal?.addEventListener("abort", onCancellation, { once: true });
+  if (ctx.signal?.aborted) onCancellation();
+  if (ctx.signal?.aborted) {
+    ctx.signal.removeEventListener("abort", onCancellation);
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorCode: "cancelled",
+      errorMessage: "Stopped before Hermes provider startup",
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      resultJson: {
+        executionCancellation: {
+          state: "acknowledged",
+          acknowledgedAt: new Date().toISOString(),
+          forced: false,
+        },
+      },
+    };
+  }
+
   let runId: string | null = null;
   try {
     // This adapter has no local child process, so crossing into the first
     // remote create request is its dispatch boundary. Report it before the
     // request can block so continuation gates may release their issue lock.
     ctx.onDispatch?.();
+    const createRequestTimeoutMs = timeoutMs > 0
+      ? Math.min(timeoutMs, 30_000)
+      : 30_000;
     const created = await fetchJson(createRunUrl, {
       method: "POST",
       headers: runHeaders,
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(createRequestTimeoutMs),
     });
     runId = extractRunId(created);
     if (!runId) {
+      ctx.signal?.removeEventListener("abort", onCancellation);
       return {
         exitCode: 1,
         signal: null,
@@ -897,6 +942,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
   } catch (err) {
+    ctx.signal?.removeEventListener("abort", onCancellation);
     return errorResult(err, redactText);
   }
 
@@ -904,7 +950,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const state = createExecutionState(runId);
   const controller = new AbortController();
-  void consumeEvents({
+  const eventConsumer = consumeEvents({
     ctx,
     baseUrl,
     headers: eventHeaders,
@@ -913,7 +959,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     reconnectMs,
     redactText,
   }).catch(() => undefined);
-  void pollStatus({
+  const statusPoller = pollStatus({
     ctx,
     baseUrl,
     headers: eventHeaders,
@@ -929,13 +975,99 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
   });
 
-  const outcome = await Promise.race([state.terminalPromise, timeoutPromise]);
+  const outcome = await Promise.race([state.terminalPromise, timeoutPromise, cancellationPromise]);
   if (timeoutTimer) clearTimeout(timeoutTimer);
   controller.abort();
+  await Promise.allSettled([eventConsumer, statusPoller]);
+  const cancellationRequested = outcome === "cancelled" || ctx.signal?.aborted === true;
+  ctx.signal?.removeEventListener("abort", onCancellation);
+
+  if (cancellationRequested) {
+    const stopDeadlineAt = Date.now() + STOP_GRACE_MS;
+    const stopStatus = await stopRun({
+      ctx,
+      baseUrl,
+      headers: eventHeaders,
+      runId,
+      deadlineAt: stopDeadlineAt,
+      redactText,
+    });
+    const finalStatus = await fetchFinalStatus({
+      baseUrl,
+      headers: eventHeaders,
+      runId,
+      deadlineAt: stopDeadlineAt,
+    });
+    const verifiedStatus = finalStatus ?? stopStatus;
+    const normalizedStatus = extractStatus(verifiedStatus);
+    if (normalizedStatus && TERMINAL_STATUSES.has(normalizedStatus)) {
+      const terminalResult = mapFinalResultForTest({
+        terminal: {
+          runId,
+          status: normalizedStatus,
+          eventName: state.lastEventName,
+          payload: verifiedStatus,
+          output: extractOutput(verifiedStatus),
+        },
+        outputChunks: state.outputChunks,
+        sessionKey,
+        strategy,
+        redactText,
+      });
+      return {
+        ...terminalResult,
+        resultJson: {
+          ...terminalResult.resultJson,
+          conversationContinuation: "continue_conversation_v1",
+          executionCancellation: {
+            state: "acknowledged",
+            acknowledgedAt: new Date().toISOString(),
+            forced: false,
+          },
+        },
+      };
+    }
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "hermes_gateway_stop_unverified",
+      errorMessage: "Hermes gateway stop was requested, but provider termination could not be verified.",
+      provider: "hermes_gateway",
+      resultJson: {
+        run_id: runId,
+        status: normalizedStatus ?? "unknown",
+        last_event: state.lastEventName,
+        final_status: redactForLog(verifiedStatus, [], 0, redactText),
+        executionCancellation: {
+          state: "unverified",
+          requestedAt: new Date().toISOString(),
+        },
+      },
+      sessionParams: {
+        hermesRunId: runId,
+        strategy,
+      },
+      sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
+    };
+  }
 
   if (outcome === "timeout") {
-    await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
-    const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+    const stopDeadlineAt = Date.now() + STOP_GRACE_MS;
+    await stopRun({
+      ctx,
+      baseUrl,
+      headers: eventHeaders,
+      runId,
+      deadlineAt: stopDeadlineAt,
+      redactText,
+    });
+    const finalStatus = await fetchFinalStatus({
+      baseUrl,
+      headers: eventHeaders,
+      runId,
+      deadlineAt: stopDeadlineAt,
+    });
     return {
       exitCode: 1,
       signal: null,

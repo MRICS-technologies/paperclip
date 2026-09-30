@@ -550,6 +550,78 @@ describe("execute", () => {
     expect(result.errorMessage).not.toContain("paperclip:company:company-1:agent:agent-1:issue:issue-1");
   });
 
+  it("acknowledges cancellation before Hermes provider startup without dispatching", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("Stopped before startup"));
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const ctx = makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "test-credential",
+      timeoutSec: 5,
+    });
+    ctx.signal = controller.signal;
+    ctx.onCancellationReady = vi.fn(async () => undefined);
+
+    const result = await execute(ctx);
+
+    expect(ctx.onCancellationReady).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.executionRecovery).toEqual({ kind: "bootstrap", providerWorkStarted: false });
+    expect(result.resultJson?.executionCancellation).toEqual(
+      expect.objectContaining({ state: "acknowledged" }),
+    );
+  });
+
+  it("stops and verifies the remote Hermes run when the operator interrupts", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        expect(ctx.onCancellationReady).toHaveBeenCalledTimes(1);
+        controller.abort(new Error("Interrupted to send queued messages"));
+        return new Response(JSON.stringify({ run_id: "run-interrupted", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      }
+      if (url.endsWith("/stop")) {
+        return new Response(JSON.stringify({ status: "stopping" }), { status: 200 });
+      }
+      if (init?.method === "GET") {
+        return new Response(JSON.stringify({ status: "cancelled", last_event: "run.cancelled" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: "running" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const ctx = makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "test-credential",
+      timeoutSec: 0.01,
+    });
+    ctx.signal = controller.signal;
+    ctx.onCancellationReady = vi.fn(async () => undefined);
+
+    const result = await execute(ctx);
+
+    expect(ctx.onCancellationReady).toHaveBeenCalledTimes(1);
+    expect(result.timedOut).toBe(false);
+    expect(result.errorCode).toBe("hermes_gateway_cancelled");
+    expect(result.resultJson?.conversationContinuation).toBe("continue_conversation_v1");
+    expect(result.executionRecovery).toBeUndefined();
+    expect(result.resultJson?.executionCancellation).toEqual(
+      expect.objectContaining({ state: "acknowledged" }),
+    );
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/stop"))).toBe(true);
+  });
+
   it("calls stop on timeout", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -557,7 +629,13 @@ describe("execute", () => {
         return new Response(JSON.stringify({ run_id: "run-slow", status: "started" }), { status: 200 });
       }
       if (url.endsWith("/events")) {
-        return new Promise<Response>(() => {});
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
       }
       if (url.endsWith("/stop")) {
         return new Response(JSON.stringify({ status: "stopping" }), { status: 200 });

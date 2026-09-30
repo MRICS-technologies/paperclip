@@ -1,0 +1,94 @@
+name: MRICS production image
+
+on:
+  push:
+    branches:
+      - "mrics/prod"
+    tags:
+      - "mrics/v*"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: mrics-production-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/mrics-technologies/paperclip
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute build metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(git describe --tags --match 'v*' --long --dirty 2>/dev/null || true)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Generate image tags and labels
+        id: docker-meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=prod,enable=${{ github.ref == 'refs/heads/mrics/prod' }}
+            type=sha,prefix=mrics-sha-
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.source=https://github.com/MRICS-technologies/paperclip
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.metadata.outputs.version }}
+
+      - name: Build and push production image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: production
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            PAPERCLIP_BUILD_VERSION=${{ steps.metadata.outputs.version }}
+            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+            CLI_TOOLS_CACHE_EPOCH=${{ steps.metadata.outputs.epoch }}
+          tags: ${{ steps.docker-meta.outputs.tags }}
+          labels: ${{ steps.docker-meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-amd64,mode=max
+
+      - name: Publish immutable deployment reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${IMAGE}@${{ steps.build.outputs.digest }}" | tee image-reference.txt
+
+      - name: Upload deployment reference
+        uses: actions/upload-artifact@v6
+        with:
+          name: mrics-paperclip-image-reference
+          path: image-reference.txt
+          retention-days: 30
