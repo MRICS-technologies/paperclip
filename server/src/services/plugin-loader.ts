@@ -719,6 +719,22 @@ export function isStandaloneBundledPluginPath(
   return isPathWithin(path.join(repoRoot, "packages", "plugins", "sandbox-providers"), packageRoot);
 }
 
+/**
+ * The production container image (Dockerfile `production` stage, which sets
+ * PAPERCLIP_PRODUCTION_CONTAINER=1) does not carry a sandbox provider's
+ * standalone toolchain (its devDependencies, e.g. `tsc`), so a runtime build
+ * can only fail; providers must be baked into the image instead (`cloud`
+ * target). Keyed on that explicit marker, not NODE_ENV, so a source-checkout
+ * operator running NODE_ENV=production with a toolchain can still auto-build.
+ */
+export function isProductionStandaloneBundledPlugin(
+  packageRoot: string,
+  processEnv: NodeJS.ProcessEnv = process.env,
+  repoRoot?: string,
+): boolean {
+  return processEnv["PAPERCLIP_PRODUCTION_CONTAINER"] === "1" && isStandaloneBundledPluginPath(packageRoot, { repoRoot });
+}
+
 export function resolveDeclaredPluginEntrypoints(
   packageRoot: string,
   pkgJson: Record<string, unknown>,
@@ -770,6 +786,20 @@ function listMissingStandaloneBundledPluginRuntimeDependencies(
   return [...dependencyNames].filter(
     (packageName) => !existsSync(resolvePackageInstallPath(packageRoot, packageName)),
   );
+}
+
+function formatMissingPluginParts(
+  missingEntrypoints: PluginEntrypointPath[],
+  missingRuntimeDeps: string[],
+): string {
+  const missingDetails: string[] = [];
+  if (missingEntrypoints.length > 0) {
+    missingDetails.push(`built entrypoints: ${missingEntrypoints.map((entrypoint) => entrypoint.key).join(", ")}`);
+  }
+  if (missingRuntimeDeps.length > 0) {
+    missingDetails.push(`runtime dependencies: ${missingRuntimeDeps.join(", ")}`);
+  }
+  return missingDetails.join("; ");
 }
 
 function formatLocalPluginManualBuildHint(
@@ -877,8 +907,11 @@ export async function ensureLocalPluginBuilt(
   } = {},
 ): Promise<void> {
   const processEnv = options.processEnv ?? process.env;
-  if (processEnv["PAPERCLIP_DISABLE_PLUGIN_AUTOBUILD"] === "1") return;
   if (!isRepoBundledPluginPath(packageRoot, { repoRoot: options.repoRoot })) return;
+  // The production container still validates a sandbox provider (even with
+  // auto-build disabled); it just never installs or builds one.
+  const productionStandalone = isProductionStandaloneBundledPlugin(packageRoot, processEnv, options.repoRoot);
+  if (processEnv["PAPERCLIP_DISABLE_PLUGIN_AUTOBUILD"] === "1" && !productionStandalone) return;
 
   const missingEntrypoints = listMissingDeclaredPluginEntrypoints(packageRoot, pkgJson);
   const missingStandaloneRuntimeDeps = isStandaloneBundledPluginPath(packageRoot, { repoRoot: options.repoRoot })
@@ -887,6 +920,14 @@ export async function ensureLocalPluginBuilt(
   if (missingEntrypoints.length === 0 && missingStandaloneRuntimeDeps.length === 0) return;
 
   const packageName = pkgJson["name"];
+  if (productionStandalone) {
+    throw new Error(
+      `Sandbox provider ${String(packageName)} is not prebuilt in this image (missing ` +
+        `${formatMissingPluginParts(missingEntrypoints, missingStandaloneRuntimeDeps)}). ` +
+        "Production never installs or builds sandbox providers at runtime; deploy an image built with " +
+        `Docker target \`cloud\` and CLOUD_BUNDLED_PLUGINS including \`${path.basename(packageRoot)}\`.`,
+    );
+  }
   const manualBuildCommand = buildLocalPluginRecoveryCommand(packageRoot, pkgJson, { repoRoot: options.repoRoot });
   if (typeof packageName !== "string" || packageName.trim().length === 0 || !manualBuildCommand) return;
 
@@ -924,15 +965,9 @@ export async function ensureLocalPluginBuilt(
     ? listMissingStandaloneBundledPluginRuntimeDependencies(packageRoot, pkgJson)
     : [];
   if (stillMissingEntrypoints.length > 0 || stillMissingStandaloneRuntimeDeps.length > 0) {
-    const missingDetails: string[] = [];
-    if (stillMissingEntrypoints.length > 0) {
-      missingDetails.push(`built entrypoints: ${stillMissingEntrypoints.map((entrypoint) => entrypoint.key).join(", ")}`);
-    }
-    if (stillMissingStandaloneRuntimeDeps.length > 0) {
-      missingDetails.push(`runtime dependencies: ${stillMissingStandaloneRuntimeDeps.join(", ")}`);
-    }
     throw new Error(
-      `Bundled local plugin ${packageName} is still missing ${missingDetails.join("; ")} after auto-build. ` +
+      `Bundled local plugin ${packageName} is still missing ` +
+        `${formatMissingPluginParts(stillMissingEntrypoints, stillMissingStandaloneRuntimeDeps)} after auto-build. ` +
         `Run \`${manualBuildCommand}\` from the repo root and retry.`,
     );
   }

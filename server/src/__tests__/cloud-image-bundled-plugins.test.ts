@@ -21,6 +21,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
 const workflow = readFileSync(path.join(repoRoot, ".github", "workflows", "docker.yml"), "utf8");
 const cloudWorkflow = readFileSync(path.join(repoRoot, ".github", "workflows", "docker-cloud.yml"), "utf8");
+const mricsWorkflow = readFileSync(path.join(repoRoot, ".github", "workflows", "mrics-production-image.yml"), "utf8");
 
 function parseList(source: string, pattern: RegExp, label: string): string[] {
   const match = source.match(pattern);
@@ -120,5 +121,64 @@ describe("cloud image bundled plugins", () => {
     expect(workflow).toContain("group: docker-${{ github.ref }}");
     expect(workflow).toContain("cancel-in-progress: false");
     expect(workflow).not.toContain("cancel-in-progress: true");
+  });
+
+  it("builds the MRICS production image from the cloud target with only Daytona baked", () => {
+    // The production runtime never builds sandbox providers, so the MRICS
+    // image must ship Daytona prebuilt (dist + node_modules) via `cloud`.
+    expect(mricsWorkflow).toMatch(/^\s*target: cloud$/m);
+    expect(mricsWorkflow).not.toMatch(/^\s*target: production$/m);
+    expect(parseList(mricsWorkflow, /^\s*CLOUD_BUNDLED_PLUGINS=(.*)$/m, "MRICS workflow")).toEqual(["daytona"]);
+    expect(mricsWorkflow).toMatch(/^\s*CLOUD_BUNDLED_SERVER_DEPS=@sentry\/node$/m);
+    expect(BUNDLED_PLUGIN_CATALOG.find((entry) => entry.key === "daytona")?.relativePath)
+      .toBe("sandbox-providers/daytona");
+  });
+
+  it("bakes sandbox providers from their committed lockfile without install scripts", () => {
+    const stage = dockerfile.split(/^FROM build AS cloud-plugins$/m)[1]?.split(/^FROM /m)[0] ?? "";
+    expect(stage).toContain('pnpm -C "$dir" install --ignore-workspace --ignore-scripts --frozen-lockfile;');
+    expect(stage).not.toMatch(/^\s*pnpm [^\n]*--no-lockfile/m);
+    // Providers do not declare the SDK; it must be linked before the build.
+    const link = stage.indexOf(`m.linkSdkInto(process.argv[1]))" "$PWD/$dir";`);
+    expect(link).toBeGreaterThan(stage.indexOf("--frozen-lockfile;"));
+    expect(stage.indexOf('pnpm -C "$dir" build;')).toBeGreaterThan(link);
+    // After the build, devDependencies are pruned and the SDK link is
+    // restored, then both are verified.
+    const prune = stage.indexOf('pnpm -C "$dir" prune --prod --ignore-scripts;');
+    expect(prune).toBeGreaterThan(stage.indexOf('pnpm -C "$dir" build;'));
+    expect(stage.indexOf(`m.linkSdkInto(process.argv[1]))" "$PWD/$dir";`, prune)).toBeGreaterThan(prune);
+    expect(stage.slice(prune)).toContain("still has devDependency");
+    expect(stage.slice(prune)).toContain("lost its @paperclipai/plugin-sdk link after prune");
+    for (const name of parseList(dockerfile, /^ARG CLOUD_BUNDLED_PLUGINS="(.*)"$/m, "Dockerfile")) {
+      expect(existsSync(path.join(repoRoot, "packages", "plugins", "sandbox-providers", name, "pnpm-lock.yaml")), name).toBe(true);
+    }
+  });
+
+  it("proves each baked provider loads its SDK and dependencies from the final cloud image", () => {
+    const cloudStage = dockerfile.split(/^FROM production AS cloud$/m)[1] ?? "";
+    expect(cloudStage).toMatch(/^ARG CLOUD_BUNDLED_PLUGINS=/m);
+    expect(cloudStage).toContain("node --import /app/cli/node_modules/tsx/dist/loader.mjs --input-type=module -e");
+    expect(cloudStage).toContain("for (const name of ['@paperclipai/plugin-sdk', ...Object.keys(pkg.dependencies ?? {})]) await import(name);");
+    expect(cloudStage).toContain("for (const rel of Object.values(pkg.paperclipPlugin ?? {})) if (!fs.existsSync(rel))");
+    // The proof's tsx cache is dropped in the same layer.
+    expect(cloudStage).toMatch(/done; \\\n {2}rm -rf "\$\{TMPDIR:-\/tmp\}\/tsx-\$\(id -u\)"$/m);
+    // The proof must use the loader the server forks plugin workers with.
+    const loaderSource = readFileSync(path.join(repoRoot, "server", "src", "services", "plugin-loader.ts"), "utf8");
+    expect(loaderSource).toContain('const DEV_TSX_LOADER_PATH = path.resolve(__dirname, "../../../cli/node_modules/tsx/dist/loader.mjs");');
+  });
+
+  it("marks only the production stage as the production container so runtime provider builds stay off", () => {
+    const [beforeProduction = "", afterProduction = ""] = dockerfile.split(/^FROM base AS production$/m);
+    const productionStage = afterProduction.split(/^FROM /m)[0] ?? "";
+    expect(productionStage).toMatch(/^ {2}PAPERCLIP_PRODUCTION_CONTAINER=1 \\$/m);
+    // Build stages (and so the provider bake) must not see the marker.
+    expect(beforeProduction).not.toContain("PAPERCLIP_PRODUCTION_CONTAINER");
+    expect(afterProduction.slice(productionStage.length)).not.toMatch(/PAPERCLIP_PRODUCTION_CONTAINER=/);
+  });
+
+  it("installs cloud server deps without lifecycle scripts and documents the no-lockfile trade-off", () => {
+    const stage = dockerfile.split(/^FROM build AS cloud-server-deps$/m)[1]?.split(/^FROM /m)[0] ?? "";
+    expect(stage).toContain("pnpm add --ignore-workspace --ignore-scripts --no-lockfile $specifiers");
+    expect(dockerfile).toContain("The install writes no lock file (`--no-lockfile`) on purpose.");
   });
 });

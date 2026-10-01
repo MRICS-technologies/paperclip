@@ -1,3 +1,4 @@
+import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,6 +23,19 @@ const mockSecretService = vi.hoisted(() => ({
   getById: vi.fn(),
   syncSecretRefsForTarget: vi.fn(),
 }));
+
+const mockMissingEntrypoints = vi.hoisted(() => ({
+  impl: null as null | ((packageRoot: string) => Array<{ key: string; absolutePath: string }>),
+}));
+
+vi.mock("../services/plugin-loader.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/plugin-loader.js")>();
+  return {
+    ...actual,
+    listMissingDeclaredPluginEntrypoints: (packageRoot: string, pkgJson: Record<string, unknown>) =>
+      mockMissingEntrypoints.impl?.(packageRoot) ?? actual.listMissingDeclaredPluginEntrypoints(packageRoot, pkgJson),
+  };
+});
 
 vi.mock("../services/plugin-registry.js", () => ({
   pluginRegistryService: () => mockRegistry,
@@ -169,6 +183,39 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(byPackageName.get("@paperclipai/plugin-modal")?.experimental).toBe(true);
     expect(byPackageName.get("@paperclipai/plugin-authoring-smoke-example")?.experimental).toBe(false);
     expect(typeof byPackageName.get("@paperclipai/plugin-workspace-diff")?.hasBuiltEntrypoints).toBe("boolean");
+  }, 20_000);
+
+  it("hides unbuilt sandbox providers from the bundled list in the production container", async () => {
+    // Daytona is "baked"; every other package reports a missing manifest, so
+    // modal is an unbuilt sandbox provider and workspace-diff an unbuilt
+    // workspace plugin regardless of what this checkout has built.
+    mockMissingEntrypoints.impl = (packageRoot) =>
+      packageRoot.endsWith(`${path.sep}daytona`) ? [] : [{ key: "manifest", absolutePath: path.join(packageRoot, "dist", "manifest.js") }];
+    const list = async () => {
+      const { app } = await createApp(boardActor());
+      const res = await request(app).get("/api/plugins/examples");
+      expect(res.status).toBe(200);
+      return new Map((res.body as Array<{ packageName: string; hasBuiltEntrypoints: boolean }>)
+        .map((plugin) => [plugin.packageName, plugin]));
+    };
+    try {
+      const dev = await list();
+      expect(dev.get("@paperclipai/plugin-modal")?.hasBuiltEntrypoints).toBe(false);
+
+      // NODE_ENV=production alone (a source checkout) can still auto-build.
+      vi.stubEnv("NODE_ENV", "production");
+      const sourceCheckout = await list();
+      expect(sourceCheckout.get("@paperclipai/plugin-modal")?.hasBuiltEntrypoints).toBe(false);
+
+      vi.stubEnv("PAPERCLIP_PRODUCTION_CONTAINER", "1");
+      const production = await list();
+      expect(production.has("@paperclipai/plugin-modal")).toBe(false);
+      expect(production.get("@paperclipai/plugin-daytona")?.hasBuiltEntrypoints).toBe(true);
+      expect(production.get("@paperclipai/plugin-workspace-diff")?.hasBuiltEntrypoints).toBe(false);
+    } finally {
+      mockMissingEntrypoints.impl = null;
+      vi.unstubAllEnvs();
+    }
   }, 20_000);
 
   it("rejects plugin installation for non-admin board users", async () => {

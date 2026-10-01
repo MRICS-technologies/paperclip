@@ -49,6 +49,7 @@ import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import {
   getPluginUiContributionMetadata,
+  isProductionStandaloneBundledPlugin,
   listMissingDeclaredPluginEntrypoints,
   pluginLoader,
   REPO_ROOT,
@@ -355,10 +356,14 @@ async function listBundledPlugins(): Promise<AvailableBundledPlugin[]> {
   const discovered = await bundledPluginsCache;
   // Recompute the filesystem-dependent flag per request so a plugin auto-built
   // during install is no longer reported as missing its entrypoints.
-  return discovered.map(({ entry, packageRoot, pkgJson }) => ({
-    ...entry,
-    hasBuiltEntrypoints: listMissingDeclaredPluginEntrypoints(packageRoot, pkgJson).length === 0,
-  }));
+  return discovered
+    .map(({ entry, packageRoot, pkgJson }) => ({
+      ...entry,
+      hasBuiltEntrypoints: listMissingDeclaredPluginEntrypoints(packageRoot, pkgJson).length === 0,
+    }))
+    // The production container never builds sandbox providers at runtime, so an
+    // unbuilt one is not installable there; offer only the providers baked in.
+    .filter((plugin) => plugin.hasBuiltEntrypoints || !isProductionStandaloneBundledPlugin(plugin.localPath));
 }
 
 /**

@@ -70,10 +70,15 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          target: production
+          # `cloud` = production + prebuilt sandbox providers. The production
+          # runtime never builds providers (no tsc in the image), so only the
+          # ones baked here are installable. Keep the list minimal.
+          target: cloud
           platforms: linux/amd64
           push: true
           build-args: |
+            CLOUD_BUNDLED_PLUGINS=daytona
+            CLOUD_BUNDLED_SERVER_DEPS=@sentry/node
             PAPERCLIP_BUILD_VERSION=${{ steps.metadata.outputs.version }}
             PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
             CLI_TOOLS_CACHE_EPOCH=${{ steps.metadata.outputs.epoch }}

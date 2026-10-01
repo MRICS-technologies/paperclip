@@ -214,6 +214,87 @@ describe("ensureLocalPluginBuilt", () => {
   });
 
   it.each([
+    { label: "missing dist and node_modules", buildDistImmediately: false, expected: /built entrypoints: manifest, worker, ui; runtime dependencies: @paperclipai\/plugin-sdk/ },
+    { label: "missing node_modules only", buildDistImmediately: true, expected: /missing runtime dependencies: @paperclipai\/plugin-sdk\)/ },
+  ])("rejects unbaked sandbox providers in the production container without a runtime build ($label)", async ({ buildDistImmediately, expected }) => {
+    // Regression: the production image has no provider toolchain, so the old
+    // runtime `pnpm install && pnpm build` died with "tsc: not found". A
+    // provider with dist but no node_modules must not pass as a broken worker.
+    const fixture = await createBundledPluginFixture("standalone-production", {
+      rootDir: standaloneRepoPluginRoot,
+      buildDistImmediately,
+    });
+    cleanupPaths.add(fixture.packageRoot);
+    const pkgJson = JSON.parse(await readFile(path.join(fixture.packageRoot, "package.json"), "utf8")) as Record<string, unknown>;
+
+    for (const processEnv of [{ PAPERCLIP_PRODUCTION_CONTAINER: "1" }, { PAPERCLIP_PRODUCTION_CONTAINER: "1", PAPERCLIP_DISABLE_PLUGIN_AUTOBUILD: "1" }]) {
+      const execStub = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+      const result = ensureLocalPluginBuilt(fixture.packageRoot, pkgJson, { processEnv, execFileAsyncImpl: execStub });
+      await expect(result).rejects.toThrow(expected);
+      await expect(result).rejects.toThrow(/is not prebuilt in this image.*Docker target `cloud` and CLOUD_BUNDLED_PLUGINS including `plugin-autobuild-standalone-production-/);
+      expect(execStub).not.toHaveBeenCalled();
+    }
+  });
+
+  it("accepts a baked sandbox provider in the production container without running anything", async () => {
+    const fixture = await createBundledPluginFixture("standalone-production-baked", {
+      rootDir: standaloneRepoPluginRoot,
+      buildDistImmediately: true,
+    });
+    cleanupPaths.add(fixture.packageRoot);
+    await mkdir(path.join(fixture.packageRoot, "node_modules", "@paperclipai", "plugin-sdk"), { recursive: true });
+
+    const execStub = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+    await ensureLocalPluginBuilt(
+      fixture.packageRoot,
+      JSON.parse(await readFile(path.join(fixture.packageRoot, "package.json"), "utf8")) as Record<string, unknown>,
+      { processEnv: { PAPERCLIP_PRODUCTION_CONTAINER: "1" }, execFileAsyncImpl: execStub },
+    );
+
+    expect(execStub).not.toHaveBeenCalled();
+  });
+
+  it("still auto-builds sandbox providers under NODE_ENV=production outside the production container", async () => {
+    // Regression: a source-checkout operator running NODE_ENV=production with
+    // a toolchain must keep the runtime provider build; only the image marker
+    // turns it off.
+    const fixture = await createBundledPluginFixture("standalone-node-env-production", { rootDir: standaloneRepoPluginRoot });
+    cleanupPaths.add(fixture.packageRoot);
+
+    const execStub = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+    await expect(ensureLocalPluginBuilt(
+      fixture.packageRoot,
+      JSON.parse(await readFile(path.join(fixture.packageRoot, "package.json"), "utf8")) as Record<string, unknown>,
+      { processEnv: { NODE_ENV: "production" }, execFileAsyncImpl: execStub },
+    )).rejects.toThrow(/still missing built entrypoints.*after auto-build/);
+
+    expect(execStub).toHaveBeenCalledWith(
+      "pnpm",
+      ["install", "--ignore-workspace", "--no-lockfile"],
+      { cwd: fixture.packageRoot, timeout: 120_000 },
+    );
+    expect(execStub).toHaveBeenCalledWith("pnpm", ["build"], { cwd: fixture.packageRoot, timeout: 120_000 });
+  });
+
+  it("still auto-builds workspace bundled plugins in the production container", async () => {
+    const fixture = await createBundledPluginFixture("workspace-production");
+    cleanupPaths.add(fixture.packageRoot);
+
+    const execStub = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+    await expect(ensureLocalPluginBuilt(
+      fixture.packageRoot,
+      JSON.parse(await readFile(path.join(fixture.packageRoot, "package.json"), "utf8")) as Record<string, unknown>,
+      { processEnv: { PAPERCLIP_PRODUCTION_CONTAINER: "1" }, execFileAsyncImpl: execStub },
+    )).rejects.toThrow(/still missing built entrypoints/);
+
+    expect(execStub).toHaveBeenCalledWith(
+      "pnpm",
+      ["--filter", fixture.packageName, "build"],
+      { cwd: REPO_ROOT, timeout: 120_000 },
+    );
+  });
+
+  it.each([
     undefined,
     "allowBuilds:\n  protobufjs: false\n",
     "packages:\n  - ../untrusted\ndangerouslyAllowAllBuilds: true\n",
@@ -404,5 +485,28 @@ describeEmbeddedPostgres("plugin install auto-build route", () => {
     expect(res.body.error).toContain("pnpm install --ignore-workspace --no-lockfile && pnpm build");
     expect(existsSync(path.join(fixture.distDir, "manifest.js"))).toBe(false);
     expect(mockLifecycle.load).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects unbuilt sandbox providers in the production container without attempting a runtime build", async () => {
+    vi.stubEnv("PAPERCLIP_PRODUCTION_CONTAINER", "1");
+    try {
+      const fixture = await createBundledPluginFixture("standalone-production-route", { rootDir: standaloneRepoPluginRoot });
+      cleanupPaths.add(fixture.packageRoot);
+      const app = await createInstallApp(db);
+
+      const res = await request(app)
+        .post("/api/plugins/install")
+        .send({ packageName: fixture.packageRoot, isLocalPath: true });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain(`Sandbox provider ${fixture.packageName} is not prebuilt in this image`);
+      expect(res.body.error).toContain("Docker target `cloud`");
+      expect(res.body.error).not.toContain("does not appear to be a Paperclip plugin");
+      expect(existsSync(path.join(fixture.distDir, "manifest.js"))).toBe(false);
+      expect(existsSync(path.join(fixture.packageRoot, "node_modules"))).toBe(false);
+      expect(mockLifecycle.load).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   }, 20_000);
 });

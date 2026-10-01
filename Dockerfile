@@ -175,7 +175,12 @@ COPY --chown=node:node --from=build /app /app
 # Empty for local builds, preserving the server's normal version fallbacks.
 ARG PAPERCLIP_BUILD_VERSION=""
 ARG PAPERCLIP_BUILD_COMMIT=""
+# PAPERCLIP_PRODUCTION_CONTAINER marks this image (not NODE_ENV=production,
+# which source-checkout operators also set): it carries no sandbox-provider
+# toolchain, so the server never installs or builds one at runtime and only
+# offers providers baked in by the `cloud` target below.
 ENV NODE_ENV=production \
+  PAPERCLIP_PRODUCTION_CONTAINER=1 \
   HOME=/paperclip \
   HOST=0.0.0.0 \
   PORT=3100 \
@@ -225,15 +230,31 @@ CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/di
 # directory names to build into the variant. Only what managed deployments
 # actually auto-install belongs here — every entry adds its node_modules
 # to the image. Growing the list is a one-line workflow change.
+#
+# Each provider installs from its committed pnpm-lock.yaml
+# (`--frozen-lockfile`, so two builds of one commit get the same tree) with
+# dependency lifecycle scripts disabled (`--ignore-scripts`). The provider
+# declares no dependency on @paperclipai/plugin-sdk; the in-repo SDK (built
+# above) is symlinked in after the install, exactly as the root postinstall
+# does for dev. After the build, `pnpm prune --prod` drops the provider's
+# devDependencies (tsc, vitest) from node_modules and its virtual store; the
+# SDK link (unknown to the lockfile) is then restored if needed and verified. The production runtime
+# never installs or builds a provider; the `cloud` stage below proves the
+# baked result loads from the final image.
 FROM build AS cloud-plugins
 ARG CLOUD_BUNDLED_PLUGINS="daytona"
 RUN set -eu; \
   for name in $CLOUD_BUNDLED_PLUGINS; do \
     dir="packages/plugins/sandbox-providers/$name"; \
     test -d "$dir" || { echo "ERROR: unknown sandbox provider '$name'" >&2; exit 1; }; \
-    pnpm -C "$dir" install --ignore-workspace --no-lockfile; \
+    test -f "$dir/pnpm-lock.yaml" || { echo "ERROR: $dir has no committed pnpm-lock.yaml" >&2; exit 1; }; \
+    pnpm -C "$dir" install --ignore-workspace --ignore-scripts --frozen-lockfile; \
+    node -e "import('/app/scripts/link-plugin-dev-sdk.mjs').then((m) => m.linkSdkInto(process.argv[1]))" "$PWD/$dir"; \
     pnpm -C "$dir" build; \
     test -f "$dir/dist/manifest.js" || { echo "ERROR: $dir is missing dist/manifest.js after build" >&2; exit 1; }; \
+    pnpm -C "$dir" prune --prod --ignore-scripts; \
+    node -e "import('/app/scripts/link-plugin-dev-sdk.mjs').then((m) => m.linkSdkInto(process.argv[1]))" "$PWD/$dir"; \
+    node -e "const fs = require('node:fs'); const dir = process.argv[1]; const pkg = JSON.parse(fs.readFileSync(dir + '/package.json', 'utf8')); for (const name of Object.keys(pkg.devDependencies ?? {})) if (fs.existsSync(dir + '/node_modules/' + name)) throw new Error(dir + ' still has devDependency ' + name + ' after prune'); if (!fs.existsSync(dir + '/node_modules/@paperclipai/plugin-sdk/package.json')) throw new Error(dir + ' lost its @paperclipai/plugin-sdk link after prune');" "$PWD/$dir"; \
   done
 
 # The hosted image variant ships selected optional peer packages
@@ -265,18 +286,23 @@ RUN set -eu; \
 # pin in the repo's own `package.json` by walking up — the same pnpm
 # version the rest of the build uses.
 #
-# The install writes no lock file (`--no-lockfile`, the same flag the
-# `cloud-plugins` stage above uses). Two builds of the same commit can
-# therefore install different transitive versions of a named package.
-# Three facts make this an accepted trade-off:
-# - the `cloud-plugins` stage above already has the same property, with
-#   the same flag
+# Dependency lifecycle scripts are disabled (`--ignore-scripts`), as in the
+# `cloud-plugins` stage: the named packages need no install-time build.
+#
+# The install writes no lock file (`--no-lockfile`) on purpose. Unlike the
+# `cloud-plugins` stage above, there is no committed lockfile for this
+# isolated directory, so two builds of the same commit can install
+# different transitive versions of a named package. This is an accepted
+# trade-off, with these limits:
 # - the direct version of each named package comes from one exact,
 #   single-sourced place: the `peerDependencies` block of
 #   `server/package.json`
-# - an automated check asserts the installed direct version after every
-#   build, so a transitive drift that breaks the package still fails the
-#   build
+# - only `.github/workflows/docker-cloud.yml` checks the pushed image
+#   (scripts/assert-cloud-image-sentry.mjs), and that check asserts the
+#   resolved direct `@sentry/node` version, not its transitive tree; the
+#   release and MRICS workflows do not run it
+# Committing a lockfile for this directory is the upgrade path if
+# transitive drift ever bites.
 FROM build AS cloud-server-deps
 WORKDIR /app/.cloud-server-deps
 ARG CLOUD_BUNDLED_SERVER_DEPS="@sentry/node"
@@ -290,12 +316,27 @@ RUN set -eu; \
     specifiers="$specifiers ${name}@${version}"; \
   done; \
   test -n "$specifiers" || { echo "ERROR: CLOUD_BUNDLED_SERVER_DEPS names no package" >&2; exit 1; }; \
-  pnpm add --ignore-workspace --no-lockfile $specifiers
+  pnpm add --ignore-workspace --ignore-scripts --no-lockfile $specifiers
 
 FROM production AS cloud
+ARG CLOUD_BUNDLED_PLUGINS="daytona"
 COPY --chown=node:node --from=cloud-plugins /app/packages/plugins/sandbox-providers /app/packages/plugins/sandbox-providers
 # Land the isolated install inside the server's own `node_modules`, the
 # directory Node's module resolution walks up to from `/app/server` for
 # both a CommonJS `require.resolve` and an ECMAScript `import` — an entry
 # on `NODE_PATH` would satisfy only the first and silently fail the second.
 COPY --chown=node:node --from=cloud-server-deps /app/.cloud-server-deps/node_modules /app/server/node_modules
+# Image-content proof: the production runtime refuses to install or build a
+# provider, so fail the image build unless each baked provider has every
+# declared entrypoint and, resolved from its own directory, imports the
+# plugin SDK, every runtime dependency, and its manifest (deliberately not
+# its worker, whose import starts the worker runtime) — under the same
+# tsx loader the server forks plugin workers with (DEV_TSX_LOADER_PATH in
+# server/src/services/plugin-loader.ts; the SDK's @paperclipai/shared
+# dependency exports TypeScript source). The proof's tsx transform cache is
+# removed in the same layer; the server's own (non-root) tsx run rebuilds it.
+RUN set -eu; \
+  for name in $CLOUD_BUNDLED_PLUGINS; do \
+    (cd "/app/packages/plugins/sandbox-providers/$name" && node --import /app/cli/node_modules/tsx/dist/loader.mjs --input-type=module -e "import fs from 'node:fs'; const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')); for (const rel of Object.values(pkg.paperclipPlugin ?? {})) if (!fs.existsSync(rel)) throw new Error(process.cwd() + ' is missing ' + rel); for (const name of ['@paperclipai/plugin-sdk', ...Object.keys(pkg.dependencies ?? {})]) await import(name); await import(new URL(pkg.paperclipPlugin.manifest, 'file://' + process.cwd() + '/'));"); \
+  done; \
+  rm -rf "${TMPDIR:-/tmp}/tsx-$(id -u)"
