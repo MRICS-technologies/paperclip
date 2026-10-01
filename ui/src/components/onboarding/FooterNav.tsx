@@ -23,6 +23,7 @@ export type FooterPrimaryIcon = "arrow" | "spinner" | "none";
  */
 export function FooterNav({
   onBack,
+  backDisabled,
   primaryLabel,
   primaryDisabled,
   loading,
@@ -31,6 +32,7 @@ export function FooterNav({
   onPrimary,
 }: {
   onBack?: () => void;
+  backDisabled?: boolean;
   primaryLabel: string;
   primaryDisabled?: boolean;
   loading?: boolean;
@@ -63,7 +65,7 @@ export function FooterNav({
           size="lg"
           className="rounded-full has-[>svg]:pl-4 has-[>svg]:pr-5"
           onClick={onBack}
-          disabled={loading}
+          disabled={loading || backDisabled}
         >
           <ArrowLeft className="mr-1 size-3.5" />
           Back

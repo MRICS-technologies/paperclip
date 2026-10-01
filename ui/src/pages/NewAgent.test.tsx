@@ -142,6 +142,20 @@ async function render(adapter = "pi_local", runnerProvider = "codex") {
   );
   await settle();
 }
+async function selectEnvironment(environmentId: string) {
+  const select = container.querySelector(
+    '[aria-label="Environment"]',
+  ) as HTMLSelectElement;
+  expect(select).toBeTruthy();
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(
+      HTMLSelectElement.prototype,
+      "value",
+    )!.set!.call(select, environmentId);
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await settle();
+}
 async function connect(provider: string) {
   await click(provider + "Subscription");
   await click("Connect");
@@ -600,6 +614,312 @@ describe("New agent setup", () => {
     expect(api.hire.mock.calls[0][1]).toMatchObject({
       defaultEnvironmentId: "sandbox-1",
       applyStoredClaudeLogin: true,
+    });
+  });
+  it("exposes the environment choice on Connect so a login-capable sandbox can be picked before signing in", async () => {
+    envApi.list.mockResolvedValue([
+      { id: "sandbox-default", name: "Default sandbox", driver: "sandbox", status: "active", config: { provider: "e2b" } },
+      { id: "sandbox-login", name: "Login sandbox", driver: "sandbox", status: "active", config: { provider: "daytona" } },
+    ]);
+    envApi.capabilities.mockResolvedValue({
+      sandboxProviders: {
+        e2b: { supportsLoginPty: false },
+        daytona: { supportsLoginPty: true },
+      },
+    });
+    settings.get.mockResolvedValue({ defaultEnvironmentId: "sandbox-default" });
+    await render("claude_local");
+
+    // The Connect step itself exposes the environment picker, not only Configure.
+    expect(container.textContent).toContain("Connect Atlas to Claude");
+    await selectEnvironment("sandbox-login");
+
+    expect(api.getAdapterAuthSignal).toHaveBeenCalledWith(
+      "company-1",
+      "claude_local",
+      "sandbox-login",
+    );
+
+    await click("ClaudeSubscription");
+    await click("Connect");
+    expect(api.testEnvironment.mock.calls[0][2]).toMatchObject({
+      environmentId: "sandbox-login",
+    });
+    await click("Finish setup");
+    expect(api.hire.mock.calls[0][1]).toMatchObject({
+      defaultEnvironmentId: "sandbox-login",
+    });
+  });
+  it("lets managed-sandbox-only pick an alternate non-local sandbox while hiding Local", async () => {
+    envApi.list.mockResolvedValue([
+      // A stale/cached Local row must still be hidden client-side even though
+      // the server already omits it under this policy.
+      { id: "local-1", name: "Local", driver: "local", config: {} },
+      { id: "sandbox-default", name: "Default sandbox", driver: "sandbox", status: "active", config: { provider: "e2b" } },
+      { id: "sandbox-alt", name: "Alt sandbox", driver: "sandbox", status: "active", config: { provider: "daytona" } },
+    ]);
+    envApi.capabilities.mockResolvedValue({
+      sandboxProviders: {
+        e2b: { supportsLoginPty: false },
+        daytona: { supportsLoginPty: true },
+      },
+    });
+    settings.get.mockResolvedValue({ defaultEnvironmentId: "sandbox-default" });
+    settings.getExperimental.mockResolvedValue({
+      enableNativeRunner: true,
+      enableManagedSandboxOnly: true,
+    });
+    await render("claude_local");
+
+    const select = container.querySelector(
+      '[aria-label="Environment"]',
+    ) as HTMLSelectElement;
+    expect(select.disabled).toBe(false);
+    expect(select.textContent).not.toContain("Local");
+
+    await selectEnvironment("sandbox-alt");
+    expect(api.getAdapterAuthSignal).toHaveBeenCalledWith(
+      "company-1",
+      "claude_local",
+      "sandbox-alt",
+    );
+
+    await click("ClaudeSubscription");
+    await click("Connect");
+    await click("Finish setup");
+    expect(api.hire.mock.calls[0][1]).toMatchObject({
+      defaultEnvironmentId: "sandbox-alt",
+    });
+  });
+  it("ignores a stale environment override once forced Kubernetes resolves, hiring into the forced environment", async () => {
+    envApi.list.mockResolvedValue([
+      { id: "local-1", name: "Local", driver: "local", config: {} },
+      { id: "sandbox-1", name: "Picked before forcing", driver: "sandbox", status: "active", config: { provider: "e2b" } },
+      { id: "k8s-1", name: "K8s", driver: "sandbox", status: "active", config: { provider: "kubernetes" } },
+    ]);
+    envApi.capabilities.mockResolvedValue({ sandboxProviders: { e2b: {}, kubernetes: {} } });
+    settings.get.mockResolvedValue({ defaultEnvironmentId: "local-1" });
+    let resolveGeneral: (value: { executionMode: string }) => void = () => {};
+    settings.getGeneral.mockReturnValue(
+      new Promise((resolve) => {
+        resolveGeneral = resolve;
+      }),
+    );
+    await render("gemini_local");
+
+    // Pick an environment while the forced-Kubernetes policy is still resolving.
+    await selectEnvironment("sandbox-1");
+
+    await act(async () => resolveGeneral({ executionMode: "kubernetes" }));
+    await settle();
+
+    const select = container.querySelector(
+      '[aria-label="Environment"]',
+    ) as HTMLSelectElement;
+    expect(select.disabled).toBe(true);
+
+    await click("Finish setup");
+    expect(api.hire.mock.calls[0][1]).toMatchObject({
+      defaultEnvironmentId: "k8s-1",
+    });
+  });
+  it("normalizes the disabled selector to the forced environment instead of a stale pre-policy pick", async () => {
+    envApi.list.mockResolvedValue([
+      { id: "local-1", name: "Local", driver: "local", config: {} },
+      { id: "sandbox-1", name: "Picked before forcing", driver: "sandbox", status: "active", config: { provider: "e2b" } },
+      { id: "k8s-1", name: "K8s", driver: "sandbox", status: "active", config: { provider: "kubernetes" } },
+    ]);
+    envApi.capabilities.mockResolvedValue({ sandboxProviders: { e2b: {}, kubernetes: {} } });
+    settings.get.mockResolvedValue({ defaultEnvironmentId: "local-1" });
+    let resolveGeneral: (value: { executionMode: string }) => void = () => {};
+    settings.getGeneral.mockReturnValue(
+      new Promise((resolve) => {
+        resolveGeneral = resolve;
+      }),
+    );
+    await render("gemini_local");
+
+    // Pick an environment while the forced-Kubernetes policy is still resolving.
+    await selectEnvironment("sandbox-1");
+
+    await act(async () => resolveGeneral({ executionMode: "kubernetes" }));
+    await settle();
+
+    const select = container.querySelector(
+      '[aria-label="Environment"]',
+    ) as HTMLSelectElement;
+    expect(select.disabled).toBe(true);
+    // The displayed selection must match the forced environment, not the
+    // stale "Picked before forcing" pick the disabled control can no longer
+    // act on.
+    expect(select.value).toBe("");
+    expect(
+      select.options[select.selectedIndex]?.textContent,
+    ).toContain("K8s");
+  });
+  it("clears a stale Local pick once managed-sandbox-only resolves, hiring into the managed sandbox", async () => {
+    envApi.list.mockResolvedValue([
+      { id: "local-1", name: "Local", driver: "local", status: "active", config: {} },
+      {
+        id: "sandbox-managed",
+        name: "Managed sandbox",
+        driver: "sandbox",
+        status: "active",
+        config: { provider: "daytona" },
+        metadata: { managedByPaperclip: true },
+      },
+    ]);
+    envApi.capabilities.mockResolvedValue({
+      sandboxProviders: { daytona: { supportsLoginPty: true } },
+    });
+    settings.get.mockResolvedValue({ defaultEnvironmentId: "sandbox-managed" });
+    settings.getGeneral.mockResolvedValue({ executionMode: "any" });
+    let resolveExperimental: (value: {
+      enableNativeRunner: boolean;
+      enableManagedSandboxOnly: boolean;
+    }) => void = () => {};
+    settings.getExperimental.mockReturnValue(
+      new Promise((resolve) => {
+        resolveExperimental = resolve;
+      }),
+    );
+    await render("gemini_local");
+
+    // Local is still offered while the managed-sandbox-only policy is loading.
+    const select = container.querySelector(
+      '[aria-label="Environment"]',
+    ) as HTMLSelectElement;
+    expect(select.textContent).toContain("Local");
+    await selectEnvironment("local-1");
+
+    await act(async () =>
+      resolveExperimental({
+        enableNativeRunner: true,
+        enableManagedSandboxOnly: true,
+      }),
+    );
+    await settle();
+
+    // The policy hides Local and the stale pick must not survive it.
+    expect(select.textContent).not.toContain("Local");
+    expect(select.value).toBe("");
+
+    await click("Finish setup");
+    expect(api.hire.mock.calls[0][1]).toMatchObject({
+      defaultEnvironmentId: "sandbox-managed",
+    });
+  });
+  it("keeps the created confirmation screen when the effective environment resolves asynchronously after the agent was created", async () => {
+    envApi.list.mockResolvedValue([
+      { id: "local-1", name: "Local", driver: "local", config: {} },
+      { id: "sandbox-1", name: "Sandbox", driver: "sandbox", status: "active", config: { provider: "e2b" } },
+    ]);
+    envApi.capabilities.mockResolvedValue({ sandboxProviders: { e2b: {} } });
+    api.get.mockResolvedValue({
+      id: "saved-agent",
+      companyId: "company-1",
+      name: "Atlas",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      status: "idle",
+    });
+    let resolveSettings: (value: { defaultEnvironmentId: string | null }) => void = () => {};
+    settings.get.mockReturnValue(
+      new Promise((resolve) => {
+        resolveSettings = resolve;
+      }),
+    );
+    state.params = new URLSearchParams({
+      name: "Atlas",
+      adapterType: "claude_local",
+      createdAgentId: "saved-agent",
+    });
+    await act(async () =>
+      root.render(
+        <QueryClientProvider client={cache}>
+          <TooltipProvider><NewAgent /></TooltipProvider>
+        </QueryClientProvider>,
+      ),
+    );
+    await settle();
+    expect(container.textContent).toContain("Your agent is ready");
+
+    // The instance default settles after the created agent already rendered
+    // its confirmation, moving the effective environment from the
+    // local-default fallback to the instance default.
+    await act(async () => resolveSettings({ defaultEnvironmentId: "sandbox-1" }));
+    await settle();
+
+    // The confirmation screen is unaffected: there is no live connection or
+    // test for a created agent to invalidate, and the flow must not bounce
+    // back to Connect.
+    expect(container.textContent).toContain("Your agent is ready");
+    expect(container.textContent).not.toContain("Connect Atlas to Claude");
+    expect(api.hire).not.toHaveBeenCalled();
+  });
+  it("invalidates an established subscription connection and returns to Connect when the effective environment resolves to a different one asynchronously, blocking Finish until reconnected", async () => {
+    envApi.list.mockResolvedValue([
+      { id: "local-1", name: "Local", driver: "local", config: {} },
+      { id: "sandbox-a", name: "Sandbox A", driver: "sandbox", status: "active", config: { provider: "e2b" } },
+      { id: "sandbox-b", name: "Sandbox B", driver: "sandbox", status: "active", config: { provider: "daytona" } },
+    ]);
+    envApi.capabilities.mockResolvedValue({
+      sandboxProviders: {
+        e2b: { supportsLoginPty: false },
+        daytona: { supportsLoginPty: true },
+      },
+    });
+    settings.get.mockResolvedValue({ defaultEnvironmentId: "sandbox-a" });
+    await render("claude_local");
+
+    await connect("Claude");
+    expect(api.testEnvironment).toHaveBeenCalledWith(
+      "company-1",
+      "claude_local",
+      expect.objectContaining({ environmentId: "sandbox-a" }),
+    );
+    expect(
+      [...container.querySelectorAll("button")].some(
+        (b) => b.textContent?.trim() === "Finish setup",
+      ),
+    ).toBe(true);
+
+    // The instance default resolves to a different environment asynchronously
+    // (e.g. a settings refetch), with no user action on the Environment
+    // selector — this is the path the selector's own onChange handler does
+    // not exercise, since onChange already invalidates inline.
+    await act(async () => {
+      cache.setQueryData(queryKeys.instance.settings, {
+        defaultEnvironmentId: "sandbox-b",
+      });
+    });
+    await settle();
+
+    // The stale connection and test are invalidated and the flow returns to Connect.
+    expect(container.textContent).toContain("Connect Atlas to Claude");
+    expect(
+      [...container.querySelectorAll("button")].some(
+        (b) => b.textContent?.trim() === "Finish setup",
+      ),
+    ).toBe(false);
+
+    // The stale connection cannot finish: there is no Finish control to drive,
+    // and hiring never fires for it.
+    expect(api.hire).not.toHaveBeenCalled();
+
+    // Finishing requires reconnecting against the new effective environment.
+    await connect("Claude");
+    expect(api.testEnvironment).toHaveBeenCalledWith(
+      "company-1",
+      "claude_local",
+      expect.objectContaining({ environmentId: "sandbox-b" }),
+    );
+    await click("Finish setup");
+    // No explicit environment override was ever picked on the selector — the
+    // asynchronous resolution changed only the instance default — so the
+    // agent inherits the instance default rather than pinning sandbox-b.
+    expect(api.hire.mock.calls[0][1]).toMatchObject({
+      defaultEnvironmentId: null,
     });
   });
 });

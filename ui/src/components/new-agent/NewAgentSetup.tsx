@@ -38,7 +38,10 @@ import {
   resolveManagedSandboxEnvironmentId,
 } from "@/lib/adapter-test-environment";
 import { resolveForcedKubernetesEnvironment } from "@/lib/forced-kubernetes-environment";
-import { environmentDisplayLabel } from "@/lib/managed-sandbox-environment";
+import {
+  environmentDisplayLabel,
+  filterManagedSandboxSelectableEnvironments,
+} from "@/lib/managed-sandbox-environment";
 import { buildNewAgentRuntimeConfig } from "@/lib/new-agent-runtime-config";
 import {
   PROVIDER_ENV_KEYS,
@@ -61,6 +64,7 @@ import { RuntimeTestCard, type TestState } from "../RuntimeTestCard";
 import { AgentBasicsDialog, AdapterMark } from "./AgentBasicsDialog";
 import {
   AgentProviderConnection,
+  type LoginBarrier,
   type ProviderConnection,
 } from "./AgentProviderConnection";
 
@@ -148,7 +152,10 @@ function Setup({
       ? { provider: "openrouter", method: "api_key", mode: "responsible_user" }
       : undefined,
   );
-  const [connection, setConnection] = useState<ProviderConnection | null>(null);
+  // Tagged with the environment it was made in; it is only usable there.
+  const [connection, setConnection] = useState<
+    (ProviderConnection & { environmentId: string | null }) | null
+  >(null);
   const aiBinding = runtimeAiBinding ?? connection?.aiConnection;
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("");
@@ -232,6 +239,9 @@ function Setup({
     envs.data ?? [],
   );
   const managedOnly = experimental.data?.enableManagedSandboxOnly === true;
+  const localDefaultEnvironmentId = resolveLocalDefaultEnvironmentId(
+    envs.data ?? [],
+  );
   let environmentId: string | null = null;
   let environmentError: string | null = null;
   try {
@@ -241,9 +251,7 @@ function Setup({
           agentDefaultEnvironmentId: environmentOverride || null,
           instanceDefaultEnvironmentId:
             settings.data?.defaultEnvironmentId ?? null,
-          localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(
-            envs.data ?? [],
-          ),
+          localDefaultEnvironmentId,
           managedSandboxOnly: managedOnly,
           managedSandboxEnvironmentId: resolveManagedSandboxEnvironmentId(
             envs.data ?? [],
@@ -256,14 +264,73 @@ function Setup({
         ? cause.message
         : "Could not resolve the environment.";
   }
+  // The managed-sandbox-only policy can resolve to true after the user already
+  // picked Local, while that policy's settings query was still loading (Local
+  // is only hidden from the picker once the policy is known). Drop a stale
+  // Local pick the moment the policy turns on, so a leftover Local override
+  // cannot be persisted even though the picker no longer offers it. A pick of
+  // any other (still-selectable) environment is left untouched.
+  const overrideIsLocal =
+    (environmentOverride &&
+      envs.data?.find((env) => env.id === environmentOverride)?.driver) ===
+    "local";
+  useEffect(() => {
+    if (managedOnly && overrideIsLocal) setEnvironmentOverride("");
+  }, [managedOnly, overrideIsLocal]);
+  // A subscription sign-in that may hold a server reservation. Raised by the
+  // Connect step before the login panel discovers or starts a session, and
+  // cleared only once the server is known to hold none (see
+  // `AdapterLoginPanelProps.onSessionChange`). While it is up the Connect step
+  // stays on the barrier's environment and every transition off it — the
+  // environment pick, the mode, closing the card, Back, Configure, Finish — is
+  // blocked; a policy-driven environment change waits until it is cleared.
+  const [loginBarrier, setLoginBarrier] = useState<LoginBarrier | null>(null);
+  // A sign-in that ended (completed, failed, timed out or was cancelled) on an
+  // environment the setup had already left.
+  const [signInAbandoned, setSignInAbandoned] = useState(false);
+  const changeLoginBarrier = (next: LoginBarrier | null) => {
+    // The panel will remount on the current environment with no trace of the
+    // old sign-in, so say why.
+    if (!next && loginBarrier && loginBarrier.environmentId !== environmentId)
+      setSignInAbandoned(true);
+    // A sign-in on the current environment supersedes that notice.
+    else if (next?.environmentId === environmentId) setSignInAbandoned(false);
+    setLoginBarrier(next);
+  };
+  const connectionEnvironmentId = loginBarrier
+    ? loginBarrier.environmentId
+    : environmentId;
+  // A connection or test result belongs to the environment it was made in.
+  // When the effective environment moves on (a pick or an async policy
+  // change), drop both and return to Connect. A created agent keeps its
+  // confirmation screen.
+  const testedEnvironmentId = useRef(environmentId);
+  useEffect(() => {
+    if (createdAgentId || created) return;
+    if (testedEnvironmentId.current !== environmentId) {
+      testedEnvironmentId.current = environmentId;
+      resetTest();
+    }
+    if (connection && connection.environmentId !== environmentId) {
+      setConnection(null);
+      setScreen("connect");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [environmentId, connection, createdAgentId, created]);
   const environment = envs.data?.find((env) => env.id === environmentId);
-  const sandboxProvider =
-    typeof environment?.config?.provider === "string"
-      ? environment.config.provider
+  // The connection panel renders against `connectionEnvironmentId`, which
+  // lags `environmentId` while a login barrier holds it in place.
+  const connectionEnvironment = envs.data?.find(
+    (env) => env.id === connectionEnvironmentId,
+  );
+  const connectionSandboxProvider =
+    typeof connectionEnvironment?.config?.provider === "string"
+      ? connectionEnvironment.config.provider
       : "";
-  const canLogin =
-    environment?.driver === "sandbox" &&
-    caps.data?.sandboxProviders?.[sandboxProvider]?.supportsLoginPty === true;
+  const connectionCanLogin =
+    connectionEnvironment?.driver === "sandbox" &&
+    caps.data?.sandboxProviders?.[connectionSandboxProvider]
+      ?.supportsLoginPty === true;
   const envKey =
     SETUP_CREDENTIAL_KEYS[adapterType] ?? providerKeys[provider] ?? "API_KEY";
   const savedKey = userSecrets.data?.find(
@@ -324,7 +391,7 @@ function Setup({
   const busy = testState === "running" || saving;
 
   function buildConfig(
-    nextConnection = connection,
+    nextConnection: ProviderConnection | null = connection,
     binding = selectedBinding,
   ): Record<string, unknown> {
     const values = {
@@ -378,7 +445,7 @@ function Setup({
     }
     return config;
   }
-  function preparedConfig(nextConnection = connection) {
+  function preparedConfig(nextConnection: ProviderConnection | null = connection) {
     if (multiProvider && (!model.trim() || !model.includes("/")))
       throw new Error("Choose or enter a model in provider/model format.");
     if (
@@ -408,7 +475,7 @@ function Setup({
       throw new Error("Enter the Kimi API model name.");
     return buildConfig(nextConnection);
   }
-  function pendingCredentials(nextConnection = connection) {
+  function pendingCredentials(nextConnection: ProviderConnection | null = connection) {
     if (aiBinding || nextConnection?.aiConnection) return {};
     return {
       ...nextConnection?.credentials,
@@ -418,7 +485,7 @@ function Setup({
     };
   }
 
-  async function runTest(nextConnection = connection): Promise<boolean> {
+  async function runTest(nextConnection: ProviderConnection | null = connection): Promise<boolean> {
     if (!ready) return false;
     const run = ++generation.current;
     setTestState("running");
@@ -460,11 +527,12 @@ function Setup({
       savingRef.current ||
       createdAgentId ||
       created ||
+      loginBarrier ||
       !ready ||
       !name.trim() ||
       testState === "running" ||
       testState === "fail" ||
-      (connectionAdapter && !connection)
+      (connectionAdapter && connection?.environmentId !== environmentId)
     )
       return;
     savingRef.current = true;
@@ -501,9 +569,12 @@ function Setup({
         ...(leader ? { reportsTo: leader.id } : {}),
         adapterType,
         adapterConfig: config,
-        defaultEnvironmentId:
-          environmentOverride ||
-          (forced.forced || managedOnly ? environmentId : null),
+        // Forced Kubernetes ignores environmentOverride even if it still holds
+        // a value from before the forced policy resolved: the forced
+        // environment always wins, never a stale pre-resolution pick.
+        defaultEnvironmentId: forced.forced
+          ? environmentId
+          : environmentOverride || (managedOnly ? environmentId : null),
         runtimeConfig: { ...buildNewAgentRuntimeConfig({ heartbeatEnabled: false }), ...(aiBinding ? { aiConnection: aiBinding } : {}) },
         budgetMonthlyCents: 0,
         ...(connection?.storedSessionId
@@ -620,6 +691,45 @@ function Setup({
     general.error ??
     agents.error ??
     caps.error;
+  // Shared between the Connect and Configure steps so a login-capable sandbox
+  // (or Local) can be picked before the provider login starts, not only
+  // afterward in Configure.
+  const environmentOverrideSection = !["cursor_cloud", "hermes_gateway"].includes(
+    adapterType,
+  ) ? (
+    <section className="space-y-5">
+      <h3 className="text-sm font-semibold">Environment</h3>
+      <select
+        aria-label="Environment"
+        className={controlClass}
+        // Forced Kubernetes always wins over any pre-policy pick (see the
+        // `defaultEnvironmentId` resolution below), so show the "Default"
+        // option — labeled with the forced environment — instead of visibly
+        // retaining a stale selection the disabled control can no longer act
+        // on.
+        value={forced.forced ? "" : environmentOverride}
+        disabled={forced.forced || Boolean(loginBarrier)}
+        onChange={(event) => {
+          if (loginBarrier) return;
+          setEnvironmentOverride(event.target.value);
+        }}
+      >
+        <option value="">Default: {environmentLabel}</option>
+        {filterManagedSandboxSelectableEnvironments(envs.data ?? [], managedOnly)
+          .filter((env) => env.status === "active")
+          .map((env) => (
+            <option key={env.id} value={env.id}>
+              {environmentDisplayLabel(env)}
+            </option>
+          ))}
+      </select>
+      {loginBarrier && (
+        <p role="status" className="text-sm text-muted-foreground">
+          Finish or cancel the sign-in in progress to change the environment.
+        </p>
+      )}
+    </section>
+  ) : null;
   return (
     <MotionConfig reducedMotion="user">
       <div className="mx-auto flex max-w-5xl flex-col gap-8 py-6">
@@ -676,9 +786,14 @@ function Setup({
                     type="button"
                     aria-current={step === screen ? "step" : undefined}
                     disabled={
-                      busy || Boolean(created) || index > steps.indexOf(screen)
+                      busy ||
+                      Boolean(created) ||
+                      Boolean(loginBarrier) ||
+                      index > steps.indexOf(screen)
                     }
-                    onClick={() => setScreen(step)}
+                    onClick={() => {
+                      if (!loginBarrier) setScreen(step);
+                    }}
                     className={cn(
                       "flex w-full items-center gap-3 rounded-md px-3 py-3 text-left text-sm",
                       step === screen
@@ -706,43 +821,68 @@ function Setup({
             <AnimatePresence mode="wait" initial={false}>
               <motion.div key={screen} {...stepMotion}>
                 {screen === "connect" && connectionAdapter ? (
-                  <OnboardingCard className="mx-auto">
-                    <div className="mb-8">
-                      <OnboardingHeading
-                        title="Connect a model"
-                        lede={`Connect ${name} to ${connectionAdapter === "claude_local" ? "Claude" : connectionAdapter === "grok_local" ? "Grok" : "OpenAI"}.`}
-                        center
+                  <div className="space-y-6">
+                    {environmentOverrideSection}
+                    {signInAbandoned && (
+                      <p role="alert" className="text-sm text-destructive">
+                        The environment changed while you were signing in, so
+                        that sign-in ended without being used. Sign in again
+                        for{" "}
+                        {environmentLabel}.
+                      </p>
+                    )}
+                    <OnboardingCard className="mx-auto">
+                      <div className="mb-8">
+                        <OnboardingHeading
+                          title="Connect a model"
+                          lede={`Connect ${name} to ${connectionAdapter === "claude_local" ? "Claude" : connectionAdapter === "grok_local" ? "Grok" : "OpenAI"}.`}
+                          center
+                        />
+                      </div>
+                      <AgentProviderConnection
+                        key={connectionEnvironmentId ?? "local"}
+                        companyId={companyId}
+                        adapterType={connectionAdapter}
+                        environmentId={connectionEnvironmentId}
+                        canLogin={connectionCanLogin}
+                        localEnvironment={connectionEnvironment?.driver === "local"}
+                        onBack={() => navigate("/agents/all")}
+                        testConnection={runTest}
+                        testError={
+                          error ??
+                          (
+                            result?.checks.find(
+                              (check) => check.level === "error",
+                            ) ??
+                            result?.checks.find(
+                              (check) =>
+                                check.code.includes("hello_probe") &&
+                                check.level === "warn",
+                            )
+                          )?.message
+                        }
+                        onConnected={(next) => {
+                          // A connected sign-in has ended on the server.
+                          setLoginBarrier(null);
+                          // Made on an environment the setup has since left:
+                          // stale, so the step reconnects on the current one.
+                          if (connectionEnvironmentId !== environmentId) {
+                            setSignInAbandoned(true);
+                            return;
+                          }
+                          setSignInAbandoned(false);
+                          setConnection({
+                            ...next,
+                            environmentId: connectionEnvironmentId,
+                          });
+                          resetTest();
+                          setScreen("runtime");
+                        }}
+                        loginBarrier={loginBarrier}
+                        onLoginBarrierChange={changeLoginBarrier}
                       />
-                    </div>
-                    <AgentProviderConnection
-                      key={environmentId ?? "local"}
-                      companyId={companyId}
-                      adapterType={connectionAdapter}
-                      environmentId={environmentId}
-                      canLogin={canLogin}
-                      localEnvironment={environment?.driver === "local"}
-                      onBack={() => navigate("/agents/all")}
-                      testConnection={runTest}
-                      testError={
-                        error ??
-                        (
-                          result?.checks.find(
-                            (check) => check.level === "error",
-                          ) ??
-                          result?.checks.find(
-                            (check) =>
-                              check.code.includes("hello_probe") &&
-                              check.level === "warn",
-                          )
-                        )?.message
-                      }
-                      onConnected={(next) => {
-                        setConnection(next);
-                        resetTest();
-                        setScreen("runtime");
-                      }}
-                    />
-                  </OnboardingCard>
+                    </OnboardingCard>
+                  </div>
                 ) : screen === "saved" && created ? (
                   <div className="space-y-6">
                     <div className="space-y-6 rounded-lg border border-border p-6">
@@ -1094,36 +1234,7 @@ function Setup({
                           </div>
                         )}
                       </section>
-                      {!["cursor_cloud", "hermes_gateway"].includes(
-                        adapterType,
-                      ) && (
-                        <section className="space-y-5">
-                          <h3 className="text-sm font-semibold">Environment</h3>
-                          <select
-                            aria-label="Environment"
-                            className={controlClass}
-                            value={environmentOverride}
-                            disabled={forced.forced || managedOnly}
-                            onChange={(event) => {
-                              setEnvironmentOverride(event.target.value);
-                              setConnection(null);
-                              resetTest();
-                              if (connectionAdapter) setScreen("connect");
-                            }}
-                          >
-                            <option value="">
-                              Default: {environmentLabel}
-                            </option>
-                            {(envs.data ?? [])
-                              .filter((env) => env.status === "active")
-                              .map((env) => (
-                                <option key={env.id} value={env.id}>
-                                  {environmentDisplayLabel(env)}
-                                </option>
-                              ))}
-                          </select>
-                        </section>
-                      )}
+                      {environmentOverrideSection}
                     </fieldset>
                     <RuntimeTestCard
                       state={testState}
@@ -1157,7 +1268,11 @@ function Setup({
                           !ready ||
                           busy ||
                           testState === "fail" ||
-                          Boolean(connectionAdapter && !connection)
+                          Boolean(loginBarrier) ||
+                          Boolean(
+                            connectionAdapter &&
+                              connection?.environmentId !== environmentId,
+                          )
                         }
                       >
                         {saving ? "Creating…" : "Finish setup"}

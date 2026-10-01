@@ -996,6 +996,50 @@ describe("AgentConfigForm environment selector", () => {
     expect(selector?.textContent).toContain("Fake Sandbox · sandbox");
   });
 
+  it("lets an existing agent explicitly pin Local instead of only inheriting it", async () => {
+    const result = await renderForm(
+      [
+        makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
+        makeEnvironment({
+          id: "sandbox-1",
+          name: "E2B",
+          driver: "sandbox",
+          config: { provider: "e2b" },
+        }),
+      ],
+      { defaultEnvironmentId: "local-1" },
+    );
+    roots.push(result.root);
+
+    const selector = result.container.querySelector("select") as HTMLSelectElement;
+    expect(selector).not.toBeNull();
+    expect(selector.value).toBe("local-1");
+    expect(selector.textContent).toContain("Local · local");
+  });
+
+  it("hides Local as an explicit choice under the managed-sandbox-only policy", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableEnvironments: true,
+      enableManagedSandboxOnly: true,
+    });
+    const result = await renderForm([
+      makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
+      makeEnvironment({
+        id: "managed-1",
+        name: "Managed",
+        driver: "sandbox",
+        config: { provider: "daytona" },
+        metadata: { managedByPaperclip: true },
+      }),
+    ]);
+    roots.push(result.root);
+
+    const selector = result.container.querySelector("select");
+    expect(selector).not.toBeNull();
+    expect(selector?.textContent).not.toContain("Local · local");
+    expect(selector?.textContent).toContain("Managed");
+  });
+
   it("labels the platform-managed instance default by name, without the driver key", async () => {
     mockInstanceSettingsApi.get.mockResolvedValue({ defaultEnvironmentId: "managed-1" });
     const result = await renderForm([

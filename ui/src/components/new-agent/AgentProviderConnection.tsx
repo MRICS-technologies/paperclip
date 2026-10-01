@@ -2,7 +2,7 @@ import { healthApi } from "@/api/health";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { useLocalAiLogin } from "../ai-connections/useLocalAiLogin";
 import type { AiConnectionBinding, AiConnectionLoginIntent } from "@paperclipai/shared";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { motion } from "motion/react";
 import {
@@ -32,6 +32,8 @@ export type ProviderConnection = {
   storedSessionId?: string;
   applyStoredClaudeLogin?: boolean;
 };
+/** A sign-in that may hold a server reservation on `environmentId`. */
+export type LoginBarrier = { environmentId: string | null; sessionId: string | null };
 export function AgentProviderConnection({
   companyId,
   adapterType,
@@ -43,6 +45,8 @@ export function AgentProviderConnection({
   testConnection,
   testError,
   managedAccount,
+  loginBarrier = null,
+  onLoginBarrierChange,
 }: {
   companyId: string;
   adapterType: "claude_local" | "codex_local" | "grok_local";
@@ -53,6 +57,15 @@ export function AgentProviderConnection({
   onBack: () => void;
   testConnection: (connection: ProviderConnection) => Promise<boolean>;
   testError?: string | null;
+  /**
+   * The caller's login barrier. It is raised before the subscription login
+   * panel mounts (its session discovery and start run on mount) and follows the
+   * panel's `onSessionChange`. While it is up, Back, card close, the mode
+   * switch and the saved-subscription pick are blocked, and the panel offers
+   * an explicit Cancel sign-in once a session id exists.
+   */
+  loginBarrier?: LoginBarrier | null;
+  onLoginBarrierChange?: (barrier: LoginBarrier | null) => void;
   /** Connections supplies its access intent; presentation and login controllers stay shared. */
   managedAccount?: {
     intent: AiConnectionLoginIntent;
@@ -71,8 +84,11 @@ export function AgentProviderConnection({
     },
     [],
   );
+  const loginHeld = Boolean(loginBarrier);
   const cancel = () => {
+    if (loginHeld) return;
     epoch.current++;
+    setLoginOpen(false);
     setBusy(false);
     setOpened(false);
     setAuthorizationUrl(null);
@@ -80,6 +96,11 @@ export function AgentProviderConnection({
   };
   const [methodChoice, setMethod] = useState<"subscription" | "api" | null>(managedAccount?.initialMethod === "api_key" ? "api" : managedAccount ? "subscription" : null);
   const [opened, setOpened] = useState(false);
+  // Latched for one opening of the card, so the login panel stays mounted on
+  // its environment until the card is closed, whatever `needsLogin` does.
+  const [loginOpen, setLoginOpen] = useState(false);
+  // Remounts the login panel for an in-place restart once a sign-in has ended.
+  const [loginAttempt, setLoginAttempt] = useState(0);
   const [authorizationUrl, setAuthorizationUrl] = useState<string | null>(null);
   const [loginPhase, setLoginPhase] = useState<"preparing" | "ready" | "waiting" | "connecting">("preparing");
   const phaseBeforeSubmit = useRef<"ready" | "waiting">("ready");
@@ -138,6 +159,7 @@ export function AgentProviderConnection({
     retry: false,
     enabled: !managedAccount,
   });
+  const authPending = !managedAccount && auth.isPending;
   async function connect() {
     if (busy || managedAccount?.disabled) return;
     const run = ++epoch.current;
@@ -213,7 +235,40 @@ export function AgentProviderConnection({
     !savedSubscription &&
     !savedKeys.loading &&
     !storedLogin.data &&
-    (Boolean(managedAccount) || auth.data?.status !== "present" || subscriptionId === "");
+    (Boolean(managedAccount) || (!auth.isPending && (auth.data?.status !== "present" || subscriptionId === "")));
+  const onLoginBarrierChangeRef = useRef(onLoginBarrierChange);
+  onLoginBarrierChangeRef.current = onLoginBarrierChange;
+  // Raise the barrier first; the panel renders only from the next render on.
+  // A layout effect, so that render happens before paint.
+  useLayoutEffect(() => {
+    if (!opened || !needsLogin || loginOpen) return;
+    onLoginBarrierChangeRef.current?.({ environmentId, sessionId: null });
+    setLoginOpen(true);
+  }, [opened, needsLogin, loginOpen, environmentId]);
+  // Only an explicit pick: the list loading in (which defaults to its first
+  // entry) must not close an ended sign-in the user is still looking at.
+  const pickedSaved = Boolean(subscriptionId && savedSubscription);
+  // A saved subscription picked once no sign-in is held (say after a cancel)
+  // closes the ended login rather than leaving it on screen.
+  useEffect(() => {
+    if (!loginOpen || loginHeld || !pickedSaved) return;
+    setLoginOpen(false);
+    setAuthorizationUrl(null);
+    setLoginPhase("preparing");
+  }, [loginOpen, loginHeld, pickedSaved]);
+  const showLogin = loginOpen || Boolean(needsLogin);
+  // The panel is still shown, but the server holds no sign-in for it any more
+  // (cancelled, failed, timed out, or none found).
+  const loginEnded = loginOpen && !loginHeld && Boolean(onLoginBarrierChange);
+  // Same order as the first start: the barrier goes up before the fresh panel
+  // mounts and runs its discovery and start.
+  const restartLogin = () => {
+    if (!environmentId) return;
+    onLoginBarrierChangeRef.current?.({ environmentId, sessionId: null });
+    setAuthorizationUrl(null);
+    setLoginPhase("preparing");
+    setLoginAttempt((attempt) => attempt + 1);
+  };
   return (
     <div className="min-w-0 max-w-full">
       <ModelSourceTiles
@@ -241,6 +296,7 @@ export function AgentProviderConnection({
           <CredentialModeLink
             mode={method}
             onChange={(next) => {
+              if (loginHeld) return;
               savedManagedAccount.current = null;
               setMethod(next);
               setError(null);
@@ -258,12 +314,14 @@ export function AgentProviderConnection({
         savedKeys.subscriptions.length > 0 && (
           <SavedProviderKeySelect
             options={savedKeys.subscriptions}
-            value={savedSubscription?.id ?? ""}
+            // While a new sign-in is open and nothing was picked, show the
+            // new-sign-in option rather than the list's default entry.
+            value={loginOpen && subscriptionId === null ? "" : savedSubscription?.id ?? ""}
             onChange={setSubscriptionId}
             loading={false}
             error={false}
             kind="subscription"
-            disabled={busy}
+            disabled={busy || loginHeld}
           />
         )}
       <motion.div
@@ -314,8 +372,9 @@ export function AgentProviderConnection({
                   />
                 )}
               </OnboardingLoginCard>
-            ) : needsLogin ? (
-              <AdapterLoginPanel
+            ) : showLogin ? (
+              loginOpen && environmentId && <AdapterLoginPanel
+                key={loginAttempt}
                 companyId={companyId}
                 adapterType={adapterType}
                 environmentId={environmentId}
@@ -323,6 +382,11 @@ export function AgentProviderConnection({
                 aiConnection={managedAccount?.intent ?? { provider: aiProvider, method: "subscription", name: `My ${provider} subscription`, ownership: "personal", agentIds: [], allAgents: true }}
                 autoStart
                 onStored={() => {}}
+                onSessionChange={
+                  onLoginBarrierChange
+                    ? (sessionId) => onLoginBarrierChangeRef.current?.(sessionId === null ? null : { environmentId, sessionId })
+                    : undefined
+                }
                 onPromptReady={(url) => {
                   setAuthorizationUrl(url);
                   setLoginPhase((phase) => url ? (phase === "preparing" ? "ready" : phase) : "preparing");
@@ -353,7 +417,10 @@ export function AgentProviderConnection({
                   onConnected(connection);
                 }}
               />
-            ) : savedSubscription ? null : canUseLocalLogin && !storedLogin.data ? (
+            ) : savedSubscription ? null : authPending ? (
+              // The auth signal decides whether a sign-in starts; nothing does until it answers.
+              <p role="status" className="text-sm text-muted-foreground">Checking for an existing sign-in…</p>
+            ) : canUseLocalLogin && !storedLogin.data ? (
               <LocalProviderLoginInstructions adapterType={adapterType} login={{ ...localLogin, retry: () => { setError(null); localLogin.retry(); } }} />
             ) : (
               <p className="text-sm text-muted-foreground">
@@ -381,12 +448,16 @@ export function AgentProviderConnection({
         <p role="alert" className="mt-4 text-sm text-destructive">Could not prepare sign-in. Reload this page to try again.</p>
       )}
       <FooterNav
+        backDisabled={loginHeld}
         onBack={() => {
+          if (loginHeld) return;
           if (opened) cancel();
           else onBack();
         }}
         primaryLabel={
-          opened && needsLogin
+          opened && loginEnded
+            ? "Start sign-in again"
+            : opened && showLogin
             ? loginPhase === "waiting" ? "Waiting for code"
               : loginPhase === "connecting" ? "Connecting"
               : `Sign in to ${provider}`
@@ -403,20 +474,21 @@ export function AgentProviderConnection({
           managedAccount?.disabled ||
           (Boolean(managedAccount) && method === "subscription" && !canLogin && !canUseLocalLogin) ||
           (localEnvironment && health.isPending) || localLogin.preparing || Boolean(localLogin.error) ||
-          (!managedAccount && auth.isPending) ||
+          authPending ||
           savedKeys.loading ||
           (adapterType === "claude_local" && storedLogin.isPending) ||
           !opened ||
-          (Boolean(needsLogin) && (!authorizationUrl || loginPhase !== "ready")) ||
+          (showLogin && !loginEnded && (!authorizationUrl || loginPhase !== "ready")) ||
           (method === "api" &&
             !apiKey.trim() &&
             !storedConnection &&
             !selectedKey)
         }
         loading={busy}
-        primaryIcon={opened && needsLogin ? loginPhase === "ready" ? "none" : "spinner" : undefined}
+        primaryIcon={opened && showLogin ? loginEnded || loginPhase === "ready" ? "none" : "spinner" : undefined}
         onPrimary={() => {
-          if (needsLogin) {
+          if (loginEnded) restartLogin();
+          else if (showLogin) {
             if (!authorizationUrl || loginPhase !== "ready") return;
             window.open(authorizationUrl, "_blank", "noreferrer,noopener");
             setLoginPhase("waiting");
